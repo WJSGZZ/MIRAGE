@@ -1,0 +1,19 @@
+# compiled binaries
+miraged
+miraged.exe
+miragec
+miragec.exe
+
+# TLS certificates (auto-generated, must not be committed)
+*.pem
+
+# config files with real keys/IPs
+config.json
+client.json
+
+# Go build cache
+go.sum
+
+# OS
+.DS_Store
+Thumbs.db

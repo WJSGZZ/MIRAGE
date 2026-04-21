@@ -1,0 +1,9 @@
+{
+  "listen":             "127.0.0.1:1080",
+  "server":             "YOUR_VPS_IP:443",
+  "serverPubKey":       "REPLACE — base64 X25519 public key from: miraged -genkey",
+  "sni":                "example.com",
+  "shortId":            "REPLACE — must match a shortId in server config.json",
+  "insecureSkipVerify": true,
+  "_note": "Set insecureSkipVerify to false when the server uses a real TLS cert (Let's Encrypt)."
+}
