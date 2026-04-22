@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"miraged/internal/client"
 	"miraged/internal/config"
 	"miraged/internal/dashboard"
+	"miraged/internal/sysproxy"
 	"miraged/internal/uri"
 )
 
@@ -96,12 +98,15 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string) 
 		fmt.Printf("  HTTP   : %s\n", httpListen)
 	}
 	fmt.Printf("  Server : %s\n\n", cfg.Server)
-	fmt.Println("Press Ctrl+C to stop.")
+
+	sysproxy.Set(httpListen, socks5)
+	fmt.Println("System proxy set. Press Ctrl+C to stop.")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	log.Println("miragec: shutting down")
+	sysproxy.Clear()
 	socks5Ln.Close()
 }
 
@@ -111,12 +116,22 @@ func configFromURI(raw string) (*config.ClientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	// uri.Decode returns CertPinBase64 as standard base64, but parseSpecClientFields
+	// calls ParseBase64URLNoPad which expects base64url no-pad — convert here.
+	certPin := ""
+	if strings.TrimSpace(s.CertPinBase64) != "" {
+		pinBytes, err := base64.StdEncoding.DecodeString(s.CertPinBase64)
+		if err != nil {
+			return nil, fmt.Errorf("cert_pin decode: %w", err)
+		}
+		certPin = base64.RawURLEncoding.EncodeToString(pinBytes)
+	}
 	cfg := &config.ClientConfig{
 		Name:              s.Name,
 		Server:            s.Addr,
 		PSK:               s.PSKBase64,
 		SNI:               s.SNI,
-		CertPin:           s.CertPinBase64,
+		CertPin:           certPin,
 		ClientPaddingSeed: s.PaddingSeedBase64,
 		UTLSProfile:       "chrome_auto",
 		ProxyMode:         "manual",
