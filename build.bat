@@ -10,7 +10,7 @@ echo [*] Building miragec.exe (Windows client)...
 set GOOS=windows
 set GOARCH=amd64
 set CGO_ENABLED=0
-go build -trimpath -ldflags="-s -w" -o miragec.exe ./cmd/miragec
+go build -trimpath -ldflags="-s -w -H=windowsgui" -o miragec.exe ./cmd/miragec
 if %ERRORLEVEL% NEQ 0 goto fail
 
 echo [*] Building miraged (Linux server)...

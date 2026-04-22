@@ -5,9 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -94,4 +96,30 @@ func generate(certFile, keyFile string) (tls.Certificate, error) {
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
 	)
+}
+
+// LeafCert returns the parsed leaf certificate of a tls.Certificate.
+func LeafCert(cert tls.Certificate) (*x509.Certificate, error) {
+	if cert.Leaf != nil {
+		return cert.Leaf, nil
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("certutil: certificate chain is empty")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("certutil: parse leaf certificate: %w", err)
+	}
+	return leaf, nil
+}
+
+// SPKIPinBase64URL returns the spec pin format:
+// SHA-256(SubjectPublicKeyInfo DER), base64url without padding.
+func SPKIPinBase64URL(cert tls.Certificate) (string, error) {
+	leaf, err := LeafCert(cert)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }

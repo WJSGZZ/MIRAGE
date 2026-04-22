@@ -3,69 +3,92 @@ package config
 
 import (
 	"crypto/ecdh"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+
+	"miraged/internal/protocol"
 )
 
 // ServerUser is one authorised client account on the server.
+//
+// v0 prototype uses ShortID. The spec-aligned model uses PSK -> UID.
+// Both are kept here temporarily so the repo can migrate incrementally.
 type ServerUser struct {
-	Name    string `json:"name"`    // human label, not used on the wire
-	ShortID string `json:"shortId"` // hex, 1–16 chars (1–8 bytes); unique per user
+	Name    string `json:"name"`
+	PSK     string `json:"psk,omitempty"`
+	ShortID string `json:"shortId,omitempty"`
 
-	ShortIDBytes []byte // parsed
+	PSKBytes      []byte
+	UID           [4]byte
+	ShortIDBytes  []byte
 }
 
 // ServerConfig is loaded from the server's config.json.
 type ServerConfig struct {
-	Listen string `json:"listen"` // e.g. "0.0.0.0:443"
-
-	// ServerKey: base64-encoded X25519 private key (32 bytes).
-	// Used by clients to authenticate to this server.
-	// Generate with: miraged -genkey
-	ServerKey string `json:"serverKey"`
-
-	// TLS certificate files. If both are empty a self-signed cert is
-	// auto-generated and saved next to the config file.
-	CertFile string `json:"certFile"`
-	KeyFile  string `json:"keyFile"`
-
-	// MaxTimeDiff: clock-skew tolerance in seconds (default 60).
-	MaxTimeDiff int `json:"maxTimeDiff"`
+	Listen string `json:"listen"`
 
 	Users []ServerUser `json:"users"`
 
-	// Parsed
+	// Spec-aligned fields.
+	Fallback          string `json:"fallback,omitempty"`
+	Cert              string `json:"cert,omitempty"`
+	Key               string `json:"key,omitempty"`
+	ServerPaddingSeed string `json:"server_padding_seed,omitempty"`
+	ReplayCacheTTL    int    `json:"replay_cache_ttl,omitempty"`
+	ReplayCacheCap    int    `json:"replay_cache_cap,omitempty"`
+	StatsAPI          string `json:"stats_api,omitempty"`
+	ControlToken      string `json:"control_token,omitempty"`
+
+	// Legacy prototype fields.
+	ServerKey   string `json:"serverKey,omitempty"`
+	CertFile    string `json:"certFile,omitempty"`
+	KeyFile     string `json:"keyFile,omitempty"`
+	MaxTimeDiff int    `json:"maxTimeDiff,omitempty"`
+
+	// Parsed legacy auth material.
 	PrivKey *ecdh.PrivateKey
 	PubKey  *ecdh.PublicKey
+
+	// Parsed spec-aligned fields.
+	ServerPaddingSeedBytes [16]byte
+	UserByUID              map[[4]byte]*ServerUser
 }
 
 // ClientConfig is loaded from the client's client.json.
 type ClientConfig struct {
-	Listen string `json:"listen"` // local SOCKS5 address, e.g. "127.0.0.1:1080"
+	// Spec-aligned fields.
+	Name              string   `json:"name,omitempty"`
+	Server            string   `json:"server"`
+	PSK               string   `json:"psk,omitempty"`
+	SNI               string   `json:"sni"`
+	CertPin           string   `json:"cert_pin,omitempty"`
+	CertPins          []string `json:"cert_pins,omitempty"`
+	ClientPaddingSeed string   `json:"client_padding_seed,omitempty"`
+	LocalSocks5       string   `json:"local_socks5,omitempty"`
+	LocalHTTP         string   `json:"local_http,omitempty"`
+	StatsAPI          string   `json:"stats_api,omitempty"`
+	UTLSProfile       string   `json:"utls_profile,omitempty"`
+	ProxyMode         string   `json:"proxy_mode,omitempty"`
 
-	// Server is the MIRAGE server address, e.g. "1.2.3.4:443".
-	Server string `json:"server"`
+	// Legacy prototype fields.
+	Listen             string `json:"listen,omitempty"`
+	ServerPubKey       string `json:"serverPubKey,omitempty"`
+	ShortID            string `json:"shortId,omitempty"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify,omitempty"`
 
-	// ServerPubKey: base64-encoded X25519 public key of the server.
-	// Printed by: miraged -genkey
-	ServerPubKey string `json:"serverPubKey"`
-
-	// SNI sent in the TLS ClientHello.
-	SNI string `json:"sni"`
-
-	// ShortID: hex string matching one entry in the server's user list.
-	ShortID string `json:"shortId"`
-
-	// InsecureSkipVerify skips TLS certificate verification.
-	// Set true when the server uses a self-signed certificate.
-	InsecureSkipVerify bool `json:"insecureSkipVerify"`
-
-	// Parsed
+	// Parsed legacy fields.
 	ServerPub    *ecdh.PublicKey
 	ShortIDBytes []byte
+
+	// Parsed spec-aligned fields.
+	PSKBytes               []byte
+	CertPinBytes           [][]byte
+	ClientPaddingSeedBytes [16]byte
 }
 
 func LoadServer(path string) (*ServerConfig, error) {
@@ -77,35 +100,8 @@ func LoadServer(path string) (*ServerConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if cfg.Listen == "" {
-		return nil, fmt.Errorf("config: listen required")
-	}
-	if cfg.MaxTimeDiff == 0 {
-		cfg.MaxTimeDiff = 60
-	}
-
-	kb, err := base64.StdEncoding.DecodeString(cfg.ServerKey)
-	if err != nil {
-		return nil, fmt.Errorf("config: serverKey base64: %w", err)
-	}
-	cfg.PrivKey, err = ecdh.X25519().NewPrivateKey(kb)
-	if err != nil {
-		return nil, fmt.Errorf("config: serverKey X25519: %w", err)
-	}
-	cfg.PubKey = cfg.PrivKey.PublicKey()
-
-	for i := range cfg.Users {
-		u := &cfg.Users[i]
-		if u.ShortID == "" {
-			return nil, fmt.Errorf("user %d: shortId required", i)
-		}
-		u.ShortIDBytes, err = hex.DecodeString(u.ShortID)
-		if err != nil {
-			return nil, fmt.Errorf("user %d shortId: %w", i, err)
-		}
-		if len(u.ShortIDBytes) < 1 || len(u.ShortIDBytes) > 8 {
-			return nil, fmt.Errorf("user %d shortId: must be 1–8 bytes (2–16 hex chars)", i)
-		}
+	if err := cfg.normalizeServer(); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
 }
@@ -119,39 +115,34 @@ func LoadClient(path string) (*ClientConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if cfg.Listen == "" {
-		cfg.Listen = "127.0.0.1:1080"
-	}
-	if cfg.Server == "" {
-		return nil, fmt.Errorf("config: server required")
-	}
-	if cfg.ServerPubKey == "" {
-		return nil, fmt.Errorf("config: serverPubKey required")
-	}
-	if cfg.ShortID == "" {
-		return nil, fmt.Errorf("config: shortId required")
-	}
-
-	pb, err := base64.StdEncoding.DecodeString(cfg.ServerPubKey)
-	if err != nil {
-		return nil, fmt.Errorf("config: serverPubKey base64: %w", err)
-	}
-	cfg.ServerPub, err = ecdh.X25519().NewPublicKey(pb)
-	if err != nil {
-		return nil, fmt.Errorf("config: serverPubKey X25519: %w", err)
-	}
-
-	cfg.ShortIDBytes, err = hex.DecodeString(cfg.ShortID)
-	if err != nil {
-		return nil, fmt.Errorf("config: shortId hex: %w", err)
-	}
-	if len(cfg.ShortIDBytes) < 1 || len(cfg.ShortIDBytes) > 8 {
-		return nil, fmt.Errorf("config: shortId must be 1–8 bytes")
+	if err := ParseClientFields(&cfg); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &cfg, nil
 }
 
-// FindUser returns the ServerUser whose ShortIDBytes exactly match, or nil.
+// ParseClientFields parses the base64/hex fields of a ClientConfig that was
+// built programmatically (not via LoadClient). Call after setting the string
+// fields directly.
+func ParseClientFields(cfg *ClientConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("nil client config")
+	}
+	cfg.applyClientDefaults()
+	if strings.TrimSpace(cfg.Server) == "" {
+		return fmt.Errorf("server required")
+	}
+
+	if err := parseLegacyClientFields(cfg); err != nil {
+		return err
+	}
+	if err := parseSpecClientFields(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// FindUser returns the legacy user whose ShortIDBytes exactly match, or nil.
 func (c *ServerConfig) FindUser(shortID []byte) *ServerUser {
 	for i := range c.Users {
 		u := &c.Users[i]
@@ -170,4 +161,259 @@ func (c *ServerConfig) FindUser(shortID []byte) *ServerUser {
 		}
 	}
 	return nil
+}
+
+// FindUserByUID returns the spec-aligned user indexed by derived UID.
+func (c *ServerConfig) FindUserByUID(uid [4]byte) *ServerUser {
+	if c == nil || c.UserByUID == nil {
+		return nil
+	}
+	return c.UserByUID[uid]
+}
+
+func (cfg *ServerConfig) normalizeServer() error {
+	if strings.TrimSpace(cfg.Listen) == "" {
+		return fmt.Errorf("config: listen required")
+	}
+
+	// Mirror spec names into legacy runtime fields so existing code keeps working.
+	if cfg.CertFile == "" {
+		cfg.CertFile = cfg.Cert
+	}
+	if cfg.KeyFile == "" {
+		cfg.KeyFile = cfg.Key
+	}
+	if cfg.Cert == "" {
+		cfg.Cert = cfg.CertFile
+	}
+	if cfg.Key == "" {
+		cfg.Key = cfg.KeyFile
+	}
+	if cfg.ReplayCacheTTL == 0 {
+		cfg.ReplayCacheTTL = int(protocol.ReplayTTLSeconds)
+	}
+	if cfg.ReplayCacheCap == 0 {
+		cfg.ReplayCacheCap = 10000
+	}
+	if cfg.StatsAPI == "" {
+		cfg.StatsAPI = "127.0.0.1:9999"
+	}
+	if cfg.MaxTimeDiff == 0 {
+		cfg.MaxTimeDiff = 60
+	}
+	if err := parseLegacyServerKey(cfg); err != nil {
+		return err
+	}
+	if err := parseServerPaddingSeed(cfg); err != nil {
+		return err
+	}
+	if err := parseServerUsers(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseLegacyServerKey(cfg *ServerConfig) error {
+	if strings.TrimSpace(cfg.ServerKey) == "" {
+		return nil
+	}
+	kb, err := base64.StdEncoding.DecodeString(cfg.ServerKey)
+	if err != nil {
+		return fmt.Errorf("config: serverKey base64: %w", err)
+	}
+	cfg.PrivKey, err = ecdh.X25519().NewPrivateKey(kb)
+	if err != nil {
+		return fmt.Errorf("config: serverKey X25519: %w", err)
+	}
+	cfg.PubKey = cfg.PrivKey.PublicKey()
+	return nil
+}
+
+func parseServerPaddingSeed(cfg *ServerConfig) error {
+	if strings.TrimSpace(cfg.ServerPaddingSeed) == "" {
+		var seed [16]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			return fmt.Errorf("config: generate server_padding_seed: %w", err)
+		}
+		cfg.ServerPaddingSeedBytes = seed
+		cfg.ServerPaddingSeed = base64.StdEncoding.EncodeToString(seed[:])
+		return nil
+	}
+
+	seed, err := base64.StdEncoding.DecodeString(cfg.ServerPaddingSeed)
+	if err != nil {
+		return fmt.Errorf("config: server_padding_seed base64: %w", err)
+	}
+	if len(seed) != 16 {
+		return fmt.Errorf("config: server_padding_seed must be 16 bytes")
+	}
+	copy(cfg.ServerPaddingSeedBytes[:], seed)
+	return nil
+}
+
+func parseServerUsers(cfg *ServerConfig) error {
+	cfg.UserByUID = make(map[[4]byte]*ServerUser, len(cfg.Users))
+	for i := range cfg.Users {
+		u := &cfg.Users[i]
+		if strings.TrimSpace(u.Name) == "" {
+			u.Name = fmt.Sprintf("user-%d", i+1)
+		}
+		if strings.TrimSpace(u.PSK) != "" {
+			psk, err := base64.StdEncoding.DecodeString(u.PSK)
+			if err != nil {
+				return fmt.Errorf("user %d psk base64: %w", i, err)
+			}
+			if len(psk) != 32 {
+				return fmt.Errorf("user %d psk: must be 32 bytes", i)
+			}
+			u.PSKBytes = psk
+			uid, err := protocol.DeriveUID(psk)
+			if err != nil {
+				return fmt.Errorf("user %d uid: %w", i, err)
+			}
+			u.UID = uid
+			if prev, exists := cfg.UserByUID[uid]; exists {
+				return fmt.Errorf("uid collision between users %q and %q", prev.Name, u.Name)
+			}
+			cfg.UserByUID[uid] = u
+		}
+
+		if strings.TrimSpace(u.ShortID) == "" {
+			continue
+		}
+		shortIDBytes, err := hex.DecodeString(u.ShortID)
+		if err != nil {
+			return fmt.Errorf("user %d shortId: %w", i, err)
+		}
+		if len(shortIDBytes) < 1 || len(shortIDBytes) > 8 {
+			return fmt.Errorf("user %d shortId: must be 1-8 bytes", i)
+		}
+		u.ShortIDBytes = shortIDBytes
+	}
+	return nil
+}
+
+func (cfg *ClientConfig) applyClientDefaults() {
+	if strings.TrimSpace(cfg.LocalSocks5) == "" {
+		if strings.TrimSpace(cfg.Listen) != "" {
+			cfg.LocalSocks5 = cfg.Listen
+		} else {
+			cfg.LocalSocks5 = "127.0.0.1:1080"
+		}
+	}
+	if strings.TrimSpace(cfg.Listen) == "" {
+		cfg.Listen = cfg.LocalSocks5
+	}
+	if strings.TrimSpace(cfg.LocalHTTP) == "" {
+		cfg.LocalHTTP = nextPortAddrOrEmpty(cfg.LocalSocks5)
+	}
+	if strings.TrimSpace(cfg.StatsAPI) == "" {
+		cfg.StatsAPI = "127.0.0.1:9999"
+	}
+	if strings.TrimSpace(cfg.UTLSProfile) == "" {
+		cfg.UTLSProfile = "chrome_auto"
+	}
+	if strings.TrimSpace(cfg.ProxyMode) == "" {
+		cfg.ProxyMode = "system"
+	}
+	if len(cfg.CertPins) == 0 && strings.TrimSpace(cfg.CertPin) != "" {
+		cfg.CertPins = []string{cfg.CertPin}
+	}
+	if strings.TrimSpace(cfg.CertPin) == "" && len(cfg.CertPins) > 0 {
+		cfg.CertPin = cfg.CertPins[0]
+	}
+}
+
+func parseLegacyClientFields(cfg *ClientConfig) error {
+	if strings.TrimSpace(cfg.ServerPubKey) == "" && strings.TrimSpace(cfg.ShortID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(cfg.ServerPubKey) == "" {
+		return fmt.Errorf("serverPubKey required when using legacy shortId auth")
+	}
+	if strings.TrimSpace(cfg.ShortID) == "" {
+		return fmt.Errorf("shortId required when using legacy shortId auth")
+	}
+
+	pb, err := base64.StdEncoding.DecodeString(cfg.ServerPubKey)
+	if err != nil {
+		return fmt.Errorf("serverPubKey base64: %w", err)
+	}
+	cfg.ServerPub, err = ecdh.X25519().NewPublicKey(pb)
+	if err != nil {
+		return fmt.Errorf("serverPubKey X25519: %w", err)
+	}
+	cfg.ShortIDBytes, err = hex.DecodeString(cfg.ShortID)
+	if err != nil {
+		return fmt.Errorf("shortId hex: %w", err)
+	}
+	if len(cfg.ShortIDBytes) < 1 || len(cfg.ShortIDBytes) > 8 {
+		return fmt.Errorf("shortId must be 1-8 bytes")
+	}
+	return nil
+}
+
+func parseSpecClientFields(cfg *ClientConfig) error {
+	if strings.TrimSpace(cfg.PSK) == "" && len(cfg.CertPins) == 0 && strings.TrimSpace(cfg.ClientPaddingSeed) == "" {
+		return nil
+	}
+
+	if strings.TrimSpace(cfg.PSK) == "" {
+		return fmt.Errorf("psk required for spec client config")
+	}
+	psk, err := base64.StdEncoding.DecodeString(cfg.PSK)
+	if err != nil {
+		return fmt.Errorf("psk base64: %w", err)
+	}
+	if len(psk) != 32 {
+		return fmt.Errorf("psk must be 32 bytes")
+	}
+	cfg.PSKBytes = psk
+
+	if len(cfg.CertPins) == 0 {
+		return fmt.Errorf("cert_pin required for spec client config")
+	}
+	cfg.CertPinBytes = cfg.CertPinBytes[:0]
+	for i, pin := range cfg.CertPins {
+		raw, err := protocol.ParseBase64URLNoPad(pin)
+		if err != nil {
+			return fmt.Errorf("cert_pin[%d]: %w", i, err)
+		}
+		if len(raw) != 32 {
+			return fmt.Errorf("cert_pin[%d]: must be 32 bytes", i)
+		}
+		cfg.CertPinBytes = append(cfg.CertPinBytes, raw)
+	}
+
+	if strings.TrimSpace(cfg.ClientPaddingSeed) == "" {
+		if _, err := rand.Read(cfg.ClientPaddingSeedBytes[:]); err != nil {
+			return fmt.Errorf("generate client_padding_seed: %w", err)
+		}
+		cfg.ClientPaddingSeed = base64.StdEncoding.EncodeToString(cfg.ClientPaddingSeedBytes[:])
+		return nil
+	}
+
+	seed, err := base64.StdEncoding.DecodeString(cfg.ClientPaddingSeed)
+	if err != nil {
+		return fmt.Errorf("client_padding_seed base64: %w", err)
+	}
+	if len(seed) != 16 {
+		return fmt.Errorf("client_padding_seed must be 16 bytes")
+	}
+	copy(cfg.ClientPaddingSeedBytes[:], seed)
+	return nil
+}
+
+func nextPortAddrOrEmpty(addr string) string {
+	host, port, ok := strings.Cut(addr, ":")
+	if !ok || host == "" || port == "" {
+		return ""
+	}
+	// Leave exact increment logic to the daemon; this is only a UI-facing default.
+	switch port {
+	case "1080":
+		return host + ":1081"
+	default:
+		return ""
+	}
 }

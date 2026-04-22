@@ -107,6 +107,17 @@ miragec.exe -c client.json
 
 Then point your browser or system proxy to `SOCKS5 127.0.0.1:1080`.
 
+## Desktop shell
+
+MIRAGE is moving to a desktop architecture similar to mature proxy clients:
+
+- Go sidecar for the local proxy core
+- Desktop shell for the application window
+- One local dashboard served by the core and loaded inside the shell
+
+The new desktop shell lives in [desktop/README.md](desktop/README.md) and is
+based on Tauri rather than a hand-built Windows widget toolkit.
+
 ## TLS certificates
 
 If `certFile` and `keyFile` are left empty in `config.json`, the server

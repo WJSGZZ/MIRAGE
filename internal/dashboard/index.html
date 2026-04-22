@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MIRAGE</title>
+<style>
+:root{
+  --bg:#efe8db;
+  --bg-2:#f7f3eb;
+  --ink:#182229;
+  --muted:#627079;
+  --panel:rgba(255,255,255,.78);
+  --panel-2:rgba(255,255,255,.92);
+  --line:rgba(24,34,41,.09);
+  --accent:#0f766e;
+  --accent-2:#155e75;
+  --accent-soft:rgba(15,118,110,.12);
+  --warn:#9a6700;
+  --warn-soft:rgba(154,103,0,.10);
+  --danger:#b42318;
+  --danger-soft:rgba(180,35,24,.08);
+  --shadow:0 28px 60px rgba(43,56,62,.14);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  color:var(--ink);
+  font-family:"Segoe UI",system-ui,sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(15,118,110,.14), transparent 26%),
+    radial-gradient(circle at bottom right, rgba(21,94,117,.10), transparent 18%),
+    linear-gradient(180deg,var(--bg-2) 0%, var(--bg) 100%);
+}
+.app{
+  min-height:100vh;
+  display:grid;
+  grid-template-columns:280px 1fr;
+}
+.sidebar{
+  padding:22px 18px;
+  border-right:1px solid rgba(255,255,255,.56);
+  background:linear-gradient(180deg, rgba(255,255,255,.52), rgba(255,255,255,.26));
+  backdrop-filter:blur(14px);
+}
+.brand{
+  display:flex;align-items:center;gap:14px;
+  padding:12px;border-radius:24px;background:rgba(255,255,255,.56);border:1px solid rgba(255,255,255,.58)
+}
+.brand-mark{
+  width:48px;height:48px;border-radius:16px;
+  background:linear-gradient(135deg,var(--accent),#24333b);
+  box-shadow:0 16px 26px rgba(15,118,110,.18);
+  position:relative;
+}
+.brand-mark::before{
+  content:"";position:absolute;inset:11px;border:1px solid rgba(255,255,255,.48);border-radius:10px;
+}
+.brand h1{font-size:1.24rem;letter-spacing:.12em}
+.brand p{margin-top:4px;color:var(--muted);font-size:.86rem}
+.nav{
+  margin-top:22px;display:grid;gap:10px;
+}
+.nav-btn{
+  appearance:none;border:none;text-align:left;cursor:pointer;
+  padding:14px 16px;border-radius:18px;background:transparent;color:var(--ink);
+  transition:background .18s ease,transform .18s ease,border-color .18s ease;
+  border:1px solid transparent;
+}
+.nav-btn:hover{transform:translateY(-1px);background:rgba(255,255,255,.42)}
+.nav-btn.active{background:rgba(255,255,255,.82);border-color:var(--line);box-shadow:var(--shadow)}
+.nav-btn strong{display:block;font-size:.94rem}
+.nav-btn span{display:block;margin-top:4px;color:var(--muted);font-size:.84rem;line-height:1.45}
+.side-card{
+  margin-top:22px;padding:16px;border-radius:22px;background:rgba(24,34,41,.94);color:#f3efe8;
+}
+.side-card h3{font-size:1rem}
+.side-card p{margin-top:10px;color:rgba(243,239,232,.72);font-size:.88rem;line-height:1.6}
+.side-list{margin-top:14px;display:grid;gap:10px}
+.side-pill{padding:11px 12px;border-radius:14px;background:rgba(255,255,255,.08);font-size:.86rem;line-height:1.5}
+.main{
+  padding:26px 24px 34px;
+}
+.topbar{
+  display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:18px;
+}
+.headline h2{font-size:2rem;line-height:1.02}
+.headline p{margin-top:10px;color:var(--muted);line-height:1.65;max-width:72ch}
+.status-pill{
+  display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:999px;
+  background:var(--panel);border:1px solid rgba(255,255,255,.7);box-shadow:var(--shadow);backdrop-filter:blur(10px)
+}
+.status-dot{width:10px;height:10px;border-radius:50%;background:var(--danger);box-shadow:0 0 0 6px rgba(180,35,24,.10)}
+.status-dot.on{background:var(--accent);box-shadow:0 0 0 6px rgba(15,118,110,.10)}
+.status-text{font-size:.92rem;color:var(--muted)}
+.view{display:none}
+.view.active{display:block}
+.grid{display:grid;gap:18px}
+.grid.cols-2{grid-template-columns:1.2fr .8fr}
+.grid.cols-2-tight{grid-template-columns:1fr 1fr}
+.panel{
+  background:var(--panel);border:1px solid rgba(255,255,255,.66);border-radius:28px;box-shadow:var(--shadow);backdrop-filter:blur(14px)
+}
+.card{padding:24px}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:18px}
+.card-head h3{font-size:1.08rem}
+.card-head p{margin-top:6px;color:var(--muted);font-size:.92rem;line-height:1.58}
+.hero{
+  display:grid;grid-template-columns:1.15fr .85fr;gap:18px;margin-bottom:18px;
+}
+.hero-main h3{font-size:2.05rem;line-height:1.02;max-width:12ch}
+.hero-main p{margin-top:14px;color:var(--muted);line-height:1.72;max-width:62ch}
+.hero-accent{
+  background:linear-gradient(180deg, rgba(24,34,41,.96), rgba(24,34,41,.88));color:#f7f3eb;
+}
+.hero-accent p{color:rgba(247,243,235,.72)}
+.metric-grid,.mode-grid,.diag-grid,.proxy-grid,.server-list,.conclusion-list,.todo-list{display:grid;gap:12px}
+.metric-grid{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:18px}
+.metric,.mode,.proxy-box,.diag-box,.server-item,.todo-item,.conclusion-item{
+  padding:16px 18px;border-radius:20px;border:1px solid var(--line);background:var(--panel-2)
+}
+.metric label,.proxy-label,.diag-label,.mini-label{
+  font-size:.76rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)
+}
+.metric strong,.proxy-value,.diag-value{
+  display:block;margin-top:8px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92rem;word-break:break-all;line-height:1.6
+}
+.mode-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.mode.active{border-color:rgba(15,118,110,.22);background:rgba(15,118,110,.06)}
+.mode.warn{border-color:rgba(154,103,0,.18);background:var(--warn-soft)}
+.mode.bad{border-color:rgba(180,35,24,.18);background:var(--danger-soft)}
+.mode strong{display:block;font-size:.98rem}
+.mode p{margin-top:8px;color:var(--muted);font-size:.9rem;line-height:1.6}
+.mode .mini-label{margin-top:12px}
+.import-form,.diag-form{display:grid;grid-template-columns:1fr auto;gap:12px}
+.input{
+  width:100%;padding:14px 16px;border-radius:16px;border:1px solid var(--line);background:rgba(255,255,255,.86);
+  font-size:.94rem;color:var(--ink);outline:none;transition:border-color .18s ease, box-shadow .18s ease, transform .18s ease
+}
+.input:focus{border-color:rgba(15,118,110,.40);box-shadow:0 0 0 4px rgba(15,118,110,.10);transform:translateY(-1px)}
+.btn{
+  appearance:none;border:none;border-radius:16px;padding:13px 18px;cursor:pointer;font-size:.92rem;font-weight:600;
+  transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease
+}
+.btn:hover{transform:translateY(-1px)}
+.btn-primary{background:linear-gradient(135deg,var(--accent) 0%, var(--accent-2) 100%);color:#fff;box-shadow:0 14px 24px rgba(15,118,110,.18)}
+.btn-secondary{background:rgba(24,34,41,.05);color:var(--ink);border:1px solid rgba(24,34,41,.09)}
+.btn-connect{background:var(--accent-soft);color:#115e59;border:1px solid rgba(15,118,110,.18)}
+.btn-disconnect{background:var(--warn-soft);color:var(--warn);border:1px solid rgba(154,103,0,.16)}
+.btn-danger{background:rgba(24,34,41,.05);color:#8a5d28;border:1px solid rgba(24,34,41,.08)}
+.server-item{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center}
+.server-item.active{background:linear-gradient(180deg, rgba(15,118,110,.10), rgba(255,255,255,.92));border-color:rgba(15,118,110,.20)}
+.server-name{font-size:1rem;font-weight:700}
+.server-meta{margin-top:7px;color:var(--muted);font-size:.88rem;line-height:1.56}
+.server-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+.empty{
+  padding:30px 18px;text-align:center;border-radius:20px;background:rgba(255,255,255,.52);border:1px dashed rgba(24,34,41,.14);color:var(--muted)
+}
+.scope,.note{
+  margin-top:14px;padding:13px 14px;border-radius:16px;font-size:.9rem;line-height:1.58
+}
+.scope{background:rgba(24,34,41,.04);border:1px solid rgba(24,34,41,.08);color:var(--muted)}
+.note{background:rgba(15,118,110,.08);border:1px solid rgba(15,118,110,.12);color:#285c5a}
+.diag-grid{grid-template-columns:1fr 1fr}
+.diag-box.good,.conclusion-item.good{border-color:rgba(15,118,110,.18);background:rgba(15,118,110,.06)}
+.diag-box.bad,.conclusion-item.bad{border-color:rgba(180,35,24,.18);background:var(--danger-soft)}
+.diag-box.warn,.conclusion-item.warn{border-color:rgba(154,103,0,.18);background:var(--warn-soft)}
+.diag-title,.conclusion-head{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.diag-title strong,.conclusion-head strong{font-size:.94rem}
+.tag{
+  padding:5px 9px;border-radius:999px;font-size:.76rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase
+}
+.tag.good{background:rgba(15,118,110,.10);color:#115e59}
+.tag.bad{background:rgba(180,35,24,.10);color:var(--danger)}
+.tag.warn{background:rgba(154,103,0,.12);color:var(--warn)}
+.conclusion-item p,.todo-item p{margin-top:8px;color:var(--muted);font-size:.92rem;line-height:1.58}
+.todo-title{display:flex;align-items:center}
+.todo-badge{
+  display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;border-radius:999px;
+  background:var(--accent-soft);color:#115e59;font-weight:700;font-size:.82rem;margin-right:10px
+}
+.log{
+  height:260px;overflow:auto;padding:14px 16px;border-radius:20px;background:#1a2024;color:#d6dde1;border:1px solid rgba(255,255,255,.08);
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.82rem;line-height:1.6
+}
+@media (max-width: 1180px){
+  .app{grid-template-columns:1fr}
+  .sidebar{border-right:none;border-bottom:1px solid rgba(255,255,255,.56)}
+}
+@media (max-width: 980px){
+  .hero,.grid.cols-2,.grid.cols-2-tight,.diag-grid,.mode-grid{grid-template-columns:1fr}
+}
+@media (max-width: 760px){
+  .main{padding:18px 14px 24px}
+  .sidebar{padding:16px 14px}
+  .topbar{flex-direction:column;align-items:flex-start}
+  .metric-grid{grid-template-columns:1fr}
+  .import-form,.diag-form{grid-template-columns:1fr}
+  .server-item{grid-template-columns:1fr}
+  .server-actions{justify-content:flex-start}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <h1>MIRAGE</h1>
+        <p>Your own transport, desktop-client discipline.</p>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-btn active" data-view="overview" onclick="switchView('overview', this)">
+        <strong>Overview</strong>
+        <span>Status, local ports, and what MIRAGE is currently doing.</span>
+      </button>
+      <button class="nav-btn" data-view="proxies" onclick="switchView('proxies', this)">
+        <strong>Proxies</strong>
+        <span>Profiles, connection actions, and local proxy endpoints.</span>
+      </button>
+      <button class="nav-btn" data-view="network" onclick="switchView('network', this)">
+        <strong>Network</strong>
+        <span>Windows system proxy, WinHTTP, environment variables, and capture gaps.</span>
+      </button>
+      <button class="nav-btn" data-view="diagnostics" onclick="switchView('diagnostics', this)">
+        <strong>Diagnostics</strong>
+        <span>Listener health, outbound checks, conclusions, and copyable reports.</span>
+      </button>
+    </nav>
+
+    <div class="side-card">
+      <h3>What main clients do that we still need</h3>
+      <p>MIRAGE already handles local HTTP and SOCKS, but full software coverage still depends on which proxy channel each app honors.</p>
+      <div class="side-list">
+        <div class="side-pill">System Proxy: good for browsers and WinINet-style apps</div>
+        <div class="side-pill">WinHTTP: needed by some services and app backends</div>
+        <div class="side-pill">Environment Proxy: catches command-line tools after restart</div>
+        <div class="side-pill">Full Capture: TUN / service mode is still the missing last mile</div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="headline">
+        <h2>MIRAGE Control Center</h2>
+        <p>
+          This layout is intentionally moving away from “just a web page” and toward the mental model users expect from Clash-style desktop clients:
+          profiles, channels, diagnostics, and clear visibility into why a specific app may still bypass the proxy.
+        </p>
+      </div>
+      <div class="status-pill">
+        <div id="status-dot" class="status-dot"></div>
+        <div id="status-text" class="status-text">Not connected</div>
+      </div>
+    </div>
+
+    <section id="view-overview" class="view active">
+      <div class="hero">
+        <div class="panel card hero-main">
+          <div class="mini-label">Session</div>
+          <h3>Know what is routed, and what still is not.</h3>
+          <p>
+            The biggest gap between MIRAGE today and mature desktop clients is not tunnel reachability. It is capture coverage.
+            This dashboard now treats Windows proxy channels as first-class state so you can tell whether the remaining issue is transport, app behavior, or missing full-capture mode.
+          </p>
+          <div class="metric-grid">
+            <div class="metric"><label>HTTP / HTTPS</label><strong id="hero-http">Waiting</strong></div>
+            <div class="metric"><label>SOCKS5</label><strong id="hero-socks">Waiting</strong></div>
+            <div class="metric"><label>Proxy State</label><strong id="hero-state">Idle</strong></div>
+          </div>
+        </div>
+        <div class="panel card hero-accent">
+          <div class="mini-label">Coverage</div>
+          <h3 style="font-size:1.12rem">Mainstream-client behavior needs layered capture.</h3>
+          <p>Clash, v2rayN, and similar clients feel complete because they expose multiple capture channels and make the current mode obvious.</p>
+          <div class="mode-grid" style="margin-top:16px">
+            <div id="mode-system" class="mode"><strong>System Proxy</strong><p>Best for browsers and many desktop apps.</p></div>
+            <div id="mode-winhttp" class="mode warn"><strong>WinHTTP</strong><p>Needed for some services and app backends.</p></div>
+            <div id="mode-env" class="mode"><strong>Environment</strong><p>Works after process restart for tools that read proxy vars.</p></div>
+            <div class="mode bad"><strong>Full Capture</strong><p>TUN / service mode is still pending, so some software can still escape.</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="grid cols-2">
+        <div class="panel card">
+          <div class="card-head">
+            <div>
+              <h3>Import Server</h3>
+              <p>Paste either the legacy `mirage://` URI or the newer spec-aligned link format.</p>
+            </div>
+          </div>
+          <div class="import-form">
+            <input id="uri-input" class="input" type="text" placeholder="mirage://...">
+            <button class="btn btn-primary" onclick="importURI()">Import</button>
+          </div>
+        </div>
+        <div class="panel card">
+          <div class="card-head">
+            <div>
+              <h3>Current Session</h3>
+              <p>Local listener addresses and exported proxy values for the active connection.</p>
+            </div>
+          </div>
+          <div class="proxy-grid">
+            <div class="proxy-box"><div class="proxy-label">HTTP / HTTPS</div><div id="http-addr" class="proxy-value">Not connected</div></div>
+            <div class="proxy-box"><div class="proxy-label">SOCKS5</div><div id="socks5-addr" class="proxy-value">Not connected</div></div>
+            <div class="proxy-box"><div class="proxy-label">HTTP_PROXY / HTTPS_PROXY</div><div id="env-http" class="proxy-value">Not connected</div></div>
+            <div class="proxy-box"><div class="proxy-label">ALL_PROXY</div><div id="env-all" class="proxy-value">Not connected</div></div>
+          </div>
+          <div id="proxy-scope" class="scope" style="display:none"></div>
+          <div id="env-note" class="note" style="display:none"></div>
+          <div id="capture-gap" class="note" style="display:none;background:var(--warn-soft);border-color:rgba(154,103,0,.16);color:var(--warn)"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-proxies" class="view">
+      <div class="panel card">
+        <div class="card-head">
+          <div>
+            <h3>Servers</h3>
+            <p>Choose the active profile and switch it the way users expect from established proxy managers.</p>
+          </div>
+        </div>
+        <div id="server-list" class="server-list">
+          <div class="empty">No servers added yet.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-network" class="view">
+      <div class="grid cols-2-tight">
+        <div class="panel card">
+          <div class="card-head">
+            <div>
+              <h3>Capture Channels</h3>
+              <p>These are the same practical layers mature clients rely on. MIRAGE now shows them explicitly.</p>
+            </div>
+          </div>
+          <div class="mode-grid">
+            <div id="channel-system" class="mode"><strong>Windows System Proxy</strong><p>Browser-style apps should route here when connected.</p></div>
+            <div id="channel-winhttp" class="mode warn"><strong>WinHTTP</strong><p>Some software uses this stack instead of WinINet.</p></div>
+            <div id="channel-env" class="mode"><strong>Environment Variables</strong><p>Useful for tools and app backends after restart.</p></div>
+            <div class="mode bad"><strong>TUN / Service</strong><p>Not implemented yet, so some non-cooperative apps can still bypass MIRAGE.</p></div>
+          </div>
+        </div>
+        <div class="panel card">
+          <div class="card-head">
+            <div>
+              <h3>Roadmap</h3>
+              <p>The next steps needed to make MIRAGE feel closer to Clash-style full desktop clients.</p>
+            </div>
+          </div>
+          <div class="todo-list">
+            <div class="todo-item">
+              <div class="todo-title"><span class="todo-badge">1</span><strong>Stabilize system proxy coverage</strong></div>
+              <p>Keep WinINet, WinHTTP, and environment channels synchronized and clearly visible.</p>
+            </div>
+            <div class="todo-item">
+              <div class="todo-title"><span class="todo-badge">2</span><strong>Add true full-capture mode</strong></div>
+              <p>TUN or service mode is the missing piece for apps that ignore every higher-level proxy channel.</p>
+            </div>
+            <div class="todo-item">
+              <div class="todo-title"><span class="todo-badge">3</span><strong>Expand profile management</strong></div>
+              <p>Edit, reorder, duplicate, tag, and eventually sync profiles like mainstream clients do.</p>
+            </div>
+            <div class="todo-item">
+              <div class="todo-title"><span class="todo-badge">4</span><strong>Desktop-native behaviors</strong></div>
+              <p>Tray, single instance, startup options, and richer logs should sit beside the Go core, not inside a browser tab.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel card" style="margin-top:18px">
+        <div class="card-head">
+          <div>
+            <h3>Launch With MIRAGE</h3>
+            <p>Start a fresh process with `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` already injected. This helps with tools that read proxy settings only when they start.</p>
+          </div>
+        </div>
+        <div class="proxy-grid">
+          <div class="proxy-box">
+            <div class="proxy-label">Executable</div>
+            <input id="launch-command" class="input" type="text" placeholder="C:\Program Files\YourApp\app.exe" style="margin-top:10px">
+          </div>
+          <div class="proxy-box">
+            <div class="proxy-label">Arguments</div>
+            <input id="launch-args" class="input" type="text" placeholder="--flag value" style="margin-top:10px">
+          </div>
+        </div>
+        <div class="server-actions" style="margin-top:12px">
+          <button class="btn btn-secondary" onclick="launchPowerShell()">Open Proxied PowerShell</button>
+          <button class="btn btn-primary" onclick="launchProcess()">Launch Process</button>
+        </div>
+        <div class="scope" style="margin-top:14px">
+          Use this when a program ignores Windows system proxy updates but still honors proxy environment variables on a fresh launch.
+        </div>
+      </div>
+    </section>
+
+    <section id="view-diagnostics" class="view">
+      <div class="panel card">
+        <div class="card-head">
+          <div>
+            <h3>Diagnostics</h3>
+            <p>Run a generic proxy check against any target URL and copy the whole report without manual selection.</p>
+          </div>
+        </div>
+        <div class="diag-form">
+          <input id="diag-target" class="input" type="text" value="https://example.com" placeholder="https://example.com">
+          <button class="btn btn-primary" onclick="runDiagnostics()">Run Check</button>
+        </div>
+        <div class="server-actions" style="margin-top:12px">
+          <button class="btn btn-secondary" onclick="copyDiagnostics()">Copy Report</button>
+          <button class="btn btn-secondary" onclick="applyWinHTTP()">Apply WinHTTP (Admin)</button>
+        </div>
+        <div id="diag-meta" class="scope" style="display:none;margin-top:14px"></div>
+        <div id="diag-conclusions" class="conclusion-list" style="margin-top:14px"></div>
+        <div id="diag-grid" class="diag-grid" style="margin-top:14px"></div>
+      </div>
+      <div class="panel card" style="margin-top:18px">
+        <div class="card-head">
+          <div>
+            <h3>Session Log</h3>
+            <p>Connection actions, diagnostics, and operator guidance for the current run.</p>
+          </div>
+        </div>
+        <div id="log" class="log"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+let state = {running:false,socks5:'',http:'',envHttp:'',envAll:'',envNote:'',proxyScope:'',activeId:''};
+let servers = [];
+let lastDiagnostics = null;
+
+function switchView(name, btn) {
+  document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+}
+
+function log(msg) {
+  const el = document.getElementById('log');
+  const t = new Date().toTimeString().slice(0,8);
+  el.textContent += `[${t}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function fetchState() {
+  try {
+    const [sr, sv] = await Promise.all([
+      fetch('/api/state').then(r => r.json()),
+      fetch('/api/servers').then(r => r.json()),
+    ]);
+    state = sr;
+    servers = Array.isArray(sv) ? sv : [];
+    renderAll();
+  } catch (e) {
+    // ignore transient polling errors
+  }
+}
+
+function renderAll() {
+  const dot = document.getElementById('status-dot');
+  const txt = document.getElementById('status-text');
+  if (state.running) {
+    dot.className = 'status-dot on';
+    txt.textContent = `Connected - HTTP ${state.http} - SOCKS5 ${state.socks5}`;
+  } else {
+    dot.className = 'status-dot';
+    txt.textContent = 'Not connected';
+  }
+
+  setText('hero-http', state.running ? state.http : 'Waiting');
+  setText('hero-socks', state.running ? state.socks5 : 'Waiting');
+  setText('hero-state', state.running ? 'Applied' : 'Idle');
+  setText('http-addr', state.running ? state.http : 'Not connected');
+  setText('socks5-addr', state.running ? state.socks5 : 'Not connected');
+  setText('env-http', state.running ? state.envHttp : 'Not connected');
+  setText('env-all', state.running ? state.envAll : 'Not connected');
+
+  const scope = document.getElementById('proxy-scope');
+  if (state.running && state.proxyScope) {
+    scope.style.display = '';
+    scope.textContent = state.proxyScope;
+  } else {
+    scope.style.display = 'none';
+    scope.textContent = '';
+  }
+
+  const note = document.getElementById('env-note');
+  if (state.running && state.envNote) {
+    note.style.display = '';
+    note.textContent = state.envNote;
+  } else {
+    note.style.display = 'none';
+    note.textContent = '';
+  }
+
+  const gap = document.getElementById('capture-gap');
+  if (state.running && state.captureGap) {
+    gap.style.display = '';
+    gap.textContent = state.captureGap;
+  } else {
+    gap.style.display = 'none';
+    gap.textContent = '';
+  }
+
+  renderServers();
+  renderProxyModes();
+}
+
+function renderServers() {
+  const list = document.getElementById('server-list');
+  if (!servers.length) {
+    list.innerHTML = '<div class="empty">No servers added yet.</div>';
+    return;
+  }
+  list.innerHTML = servers.map(s => {
+    const isActive = state.running && state.activeId === s.id;
+    const actionBtn = isActive
+      ? '<button class="btn btn-disconnect" onclick="disconnect()">Disconnect</button>'
+      : `<button class="btn btn-connect" onclick="connect('${s.id}')">Connect</button>`;
+    const channel = s.psk ? 'Spec profile' : 'Legacy profile';
+    const subtitle = `${esc(s.addr)}${s.listen ? ' - local ' + esc(s.listen) : ''} - ${channel}`;
+    return `<div class="server-item${isActive ? ' active' : ''}">
+      <div>
+        <div class="server-name">${esc(s.name || s.addr)}</div>
+        <div class="server-meta">${subtitle}</div>
+      </div>
+      <div class="server-actions">
+        ${actionBtn}
+        <button class="btn btn-danger" onclick="deleteServer('${s.id}')">Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderProxyModes() {
+  const hasHttp = !!state.http;
+  const hasSocks = !!state.socks5;
+  paintMode('mode-system', hasHttp, 'warn');
+  paintMode('mode-winhttp', lastDiagnostics && hasActiveWinHTTP(lastDiagnostics), 'warn');
+  paintMode('mode-env', !!state.envHttp || !!state.envAll, 'warn');
+  paintMode('channel-system', hasHttp, 'warn');
+  paintMode('channel-winhttp', lastDiagnostics && hasActiveWinHTTP(lastDiagnostics), 'warn');
+  paintMode('channel-env', !!state.envHttp || !!state.envAll, 'warn');
+  if (!hasHttp && !hasSocks) {
+    paintMode('mode-system', false, 'bad');
+    paintMode('channel-system', false, 'bad');
+  }
+}
+
+function paintMode(id, ok, fallbackClass) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove('active', 'warn', 'bad');
+  if (ok) {
+    el.classList.add('active');
+  } else {
+    el.classList.add(fallbackClass || 'warn');
+  }
+}
+
+function hasActiveWinHTTP(data) {
+  const text = String((data.system && data.system.winHttp) || '').toLowerCase();
+  return !!text && !text.includes('direct access') && !text.includes('鐩存帴璁块棶');
+}
+
+function setText(id, value) {
+  document.getElementById(id).textContent = value;
+}
+
+async function importURI() {
+  const raw = document.getElementById('uri-input').value.trim();
+  if (!raw) return;
+  try {
+    const res = await fetch('/api/import', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({uri: raw}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      log('Import failed: ' + data.error);
+      return;
+    }
+    document.getElementById('uri-input').value = '';
+    log('Imported server: ' + (data.name || data.addr));
+    await fetchState();
+    switchView('proxies', document.querySelector('.nav-btn[data-view="proxies"]'));
+  } catch (e) {
+    log('Import error: ' + e);
+  }
+}
+
+async function connect(id) {
+  try {
+    const res = await fetch('/api/connect', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({id}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      log('Connect failed: ' + data.error);
+      return;
+    }
+    log('Connected: HTTP ' + data.http + ', SOCKS5 ' + data.socks5);
+    if (data.proxyScope) log(data.proxyScope);
+    if (data.envNote) log(data.envNote);
+    await fetchState();
+    await runDiagnostics();
+    switchView('overview', document.querySelector('.nav-btn[data-view="overview"]'));
+  } catch (e) {
+    log('Connect error: ' + e);
+  }
+}
+
+async function disconnect() {
+  try {
+    await fetch('/api/disconnect', {method:'POST'});
+    log('Disconnected');
+    await fetchState();
+  } catch (e) {
+    log('Disconnect error: ' + e);
+  }
+}
+
+async function deleteServer(id) {
+  try {
+    const res = await fetch('/api/servers/' + id, {method:'DELETE'});
+    const data = await res.json();
+    if (data.error) {
+      log('Delete failed: ' + data.error);
+      return;
+    }
+    log('Server removed');
+    await fetchState();
+  } catch (e) {
+    log('Delete error: ' + e);
+  }
+}
+
+async function runDiagnostics() {
+  const target = document.getElementById('diag-target').value.trim() || 'https://example.com';
+  try {
+    const res = await fetch('/api/diagnostics?target=' + encodeURIComponent(target));
+    const data = await res.json();
+    if (data.error) {
+      log('Diagnostics failed: ' + data.error);
+      return;
+    }
+    renderDiagnostics(data);
+    log('Diagnostics completed for ' + target);
+  } catch (e) {
+    log('Diagnostics error: ' + e);
+  }
+}
+
+function renderDiagnostics(data) {
+  lastDiagnostics = data;
+  renderProxyModes();
+
+  const meta = document.getElementById('diag-meta');
+  meta.style.display = '';
+  meta.textContent = `Snapshot ${data.timestamp}`;
+
+  document.getElementById('diag-conclusions').innerHTML = (data.conclusions || []).map(renderConclusion).join('');
+
+  const boxes = [];
+  (data.listeners || []).forEach(item => {
+    boxes.push(renderDiagBox(item.name + ' listener', item.reachable, [
+      ['Address', item.address],
+      ['Status', item.reachable ? 'reachable' : item.error || 'unreachable'],
+    ]));
+  });
+
+  boxes.push(renderDiagBox('System proxy', !!data.system.proxyServer, [
+    ['ProxyEnable', data.system.proxyEnable || '(empty)'],
+    ['ProxyServer', data.system.proxyServer || '(empty)'],
+    ['ProxyOverride', data.system.proxyOverride || '(empty)'],
+    ['AutoDetect', data.system.autoDetect || '(empty)'],
+  ]));
+
+  const winHttpActive = hasActiveWinHTTP(data);
+  boxes.push(renderDiagBox('WinHTTP', winHttpActive, [
+    ['Value', data.system.winHttp || '(empty)'],
+  ]));
+
+  const env = data.system.env || {};
+  boxes.push(renderDiagBox('Environment', !!(env.HTTP_PROXY || env.HTTPS_PROXY || env.ALL_PROXY), [
+    ['HTTP_PROXY', env.HTTP_PROXY || '(empty)'],
+    ['HTTPS_PROXY', env.HTTPS_PROXY || '(empty)'],
+    ['ALL_PROXY', env.ALL_PROXY || '(empty)'],
+    ['NO_PROXY', env.NO_PROXY || '(empty)'],
+  ]));
+
+  (data.tests || []).forEach(test => {
+    boxes.push(renderDiagBox(test.name, test.success, [
+      ['Target', test.target],
+      ['Via', test.via || '(empty)'],
+      ['Detail', test.detail || '(empty)'],
+      ['Duration', test.duration || '(n/a)'],
+    ]));
+  });
+
+  document.getElementById('diag-grid').innerHTML = boxes.join('');
+}
+
+async function copyDiagnostics() {
+  if (!lastDiagnostics) {
+    log('No diagnostics snapshot to copy yet');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(formatDiagnostics(lastDiagnostics));
+    log('Diagnostics copied to clipboard');
+  } catch (e) {
+    log('Copy failed: ' + e);
+  }
+}
+
+async function applyWinHTTP() {
+  if (!state.running || !state.http) {
+    log('WinHTTP apply skipped: MIRAGE is not connected');
+    return;
+  }
+  try {
+    log('Requesting administrator approval for WinHTTP apply');
+    const res = await fetch('/api/winhttp/apply', {method:'POST'});
+    const data = await res.json();
+    if (data.error) {
+      log('WinHTTP apply failed: ' + data.error);
+      return;
+    }
+    log('WinHTTP apply finished for ' + data.http);
+    await runDiagnostics();
+  } catch (e) {
+    log('WinHTTP apply error: ' + e);
+  }
+}
+
+async function launchPowerShell() {
+  await launchViaAPI('powershell.exe', ['-NoExit']);
+}
+
+async function launchProcess() {
+  const command = document.getElementById('launch-command').value.trim();
+  if (!command) {
+    log('Launch skipped: executable path is empty');
+    return;
+  }
+  const rawArgs = document.getElementById('launch-args').value.trim();
+  await launchViaAPI(command, splitArgs(rawArgs));
+}
+
+async function launchViaAPI(command, args) {
+  if (!state.running) {
+    log('Launch skipped: MIRAGE is not connected');
+    return;
+  }
+  try {
+    const res = await fetch('/api/launch', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({command, args}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      log('Launch failed: ' + data.error);
+      return;
+    }
+    log(`Launched ${data.command} (PID ${data.pid}) with MIRAGE proxy env`);
+  } catch (e) {
+    log('Launch error: ' + e);
+  }
+}
+
+function splitArgs(text) {
+  if (!text) return [];
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    out.push(match[1] || match[2] || match[3] || '');
+  }
+  return out;
+}
+
+function formatDiagnostics(data) {
+  const lines = [];
+  lines.push('Snapshot');
+  lines.push(data.timestamp || '');
+  lines.push('');
+
+  (data.conclusions || []).forEach(item => {
+    lines.push(item.title || '');
+    lines.push(item.level || '');
+    lines.push(item.detail || '');
+    if (item.channel) lines.push(item.channel);
+    lines.push('');
+  });
+
+  (data.listeners || []).forEach(item => {
+    lines.push(`${item.name} listener`);
+    lines.push(item.reachable ? 'OK' : 'Check');
+    lines.push('Address');
+    lines.push(item.address || '(empty)');
+    lines.push('Status');
+    lines.push(item.reachable ? 'reachable' : (item.error || 'unreachable'));
+    lines.push('');
+  });
+
+  lines.push('System proxy');
+  lines.push(data.system && data.system.proxyServer ? 'OK' : 'Check');
+  lines.push('ProxyEnable');
+  lines.push((data.system && data.system.proxyEnable) || '(empty)');
+  lines.push('ProxyServer');
+  lines.push((data.system && data.system.proxyServer) || '(empty)');
+  lines.push('ProxyOverride');
+  lines.push((data.system && data.system.proxyOverride) || '(empty)');
+  lines.push('AutoDetect');
+  lines.push((data.system && data.system.autoDetect) || '(empty)');
+  lines.push('');
+
+  lines.push('WinHTTP');
+  lines.push('Value');
+  lines.push((data.system && data.system.winHttp) || '(empty)');
+  lines.push('');
+
+  const env = (data.system && data.system.env) || {};
+  lines.push('Environment');
+  lines.push('HTTP_PROXY');
+  lines.push(env.HTTP_PROXY || '(empty)');
+  lines.push('HTTPS_PROXY');
+  lines.push(env.HTTPS_PROXY || '(empty)');
+  lines.push('ALL_PROXY');
+  lines.push(env.ALL_PROXY || '(empty)');
+  lines.push('NO_PROXY');
+  lines.push(env.NO_PROXY || '(empty)');
+  lines.push('');
+
+  (data.tests || []).forEach(test => {
+    lines.push(test.name || '');
+    lines.push(test.success ? 'OK' : 'Check');
+    lines.push('Target');
+    lines.push(test.target || '(empty)');
+    lines.push('Via');
+    lines.push(test.via || '(empty)');
+    lines.push('Detail');
+    lines.push(test.detail || '(empty)');
+    lines.push('Duration');
+    lines.push(test.duration || '(n/a)');
+    lines.push('');
+  });
+
+  return lines.join('\n').trim();
+}
+
+function renderDiagBox(title, ok, rows) {
+  return `<div class="diag-box ${ok ? 'good' : 'bad'}">
+    <div class="diag-title">
+      <strong>${esc(title)}</strong>
+      <span class="tag ${ok ? 'good' : 'bad'}">${ok ? 'OK' : 'Check'}</span>
+    </div>
+    ${rows.map(row => `<div class="diag-value"><span class="diag-label">${esc(row[0])}</span><br>${esc(row[1])}</div>`).join('')}
+  </div>`;
+}
+
+function renderConclusion(item) {
+  const level = item.level === 'error' ? 'bad' : (item.level === 'warn' ? 'warn' : 'good');
+  const label = item.level === 'error' ? 'Issue' : (item.level === 'warn' ? 'Attention' : 'Healthy');
+  return `<div class="conclusion-item ${level}">
+    <div class="conclusion-head">
+      <strong>${esc(item.title || '')}</strong>
+      <span class="tag ${level}">${label}</span>
+    </div>
+    <p>${esc(item.detail || '')}</p>
+    ${item.channel ? `<div class="mini-label" style="margin-top:10px">${esc(item.channel)}</div>` : ''}
+  </div>`;
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+fetchState();
+runDiagnostics();
+setInterval(fetchState, 2000);
+</script>
+</body>
+</html>

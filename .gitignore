@@ -10,9 +10,15 @@ miragec.exe
 # config files with real keys/IPs
 config.json
 client.json
+servers.json
 
 # Go build cache
 go.sum
+
+# desktop dependencies and build outputs
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
 
 # OS
 .DS_Store

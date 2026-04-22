@@ -1,12 +1,11 @@
 // Package client implements the MIRAGE client.
-//
-// The client keeps one persistent TLS+mux session to the server.
-// When the session dies it is re-established on the next request.
-// Multiple SOCKS5 requests share the same session via mux streams.
 package client
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -14,9 +13,13 @@ import (
 	"sync"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"miraged/internal/auth"
 	"miraged/internal/config"
 	"miraged/internal/mux"
+	"miraged/internal/protocol"
+	"miraged/internal/record"
 )
 
 // Client holds the state of one MIRAGE client instance.
@@ -32,8 +35,7 @@ func New(cfg *config.ClientConfig) *Client {
 	return &Client{cfg: cfg}
 }
 
-// Dial opens a mux stream to the given destination (e.g. "example.com:443").
-// It establishes (or reuses) the underlying TLS session to the MIRAGE server.
+// Dial opens a mux stream to the given destination.
 func (c *Client) Dial(dest string) (*mux.Stream, error) {
 	sess, err := c.getSession()
 	if err != nil {
@@ -41,14 +43,12 @@ func (c *Client) Dial(dest string) (*mux.Stream, error) {
 	}
 	st, err := sess.OpenStream(dest)
 	if err != nil {
-		// Session likely dead — drop it and let next call reconnect.
 		c.dropSession()
 		return nil, fmt.Errorf("client: open stream: %w", err)
 	}
 	return st, nil
 }
 
-// getSession returns the current live session or establishes a new one.
 func (c *Client) getSession() (*mux.Session, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -60,12 +60,7 @@ func (c *Client) getSession() (*mux.Session, error) {
 		return nil, err
 	}
 	c.session = sess
-	// When the session's underlying connection dies, clear the cached session
-	// so the next Dial will reconnect.
 	go func() {
-		// Wait for session to close by trying to drain the accept channel,
-		// which is only closed when the session dies.
-		// We detect death via a background dial that will fail.
 		waitForDeath(sess)
 		c.dropSession()
 	}()
@@ -78,17 +73,8 @@ func (c *Client) dropSession() {
 	c.mu.Unlock()
 }
 
-// connect creates a new TLS connection to the server, performs MIRAGE auth,
-// and returns an initialised mux.Session.
 func (c *Client) connect() (*mux.Session, error) {
 	cfg := c.cfg
-
-	tlsCfg := &tls.Config{
-		ServerName:         cfg.SNI,
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
-		MinVersion:         tls.VersionTLS13,
-	}
-
 	log.Printf("miragec: connecting to %s (sni=%s)", cfg.Server, cfg.SNI)
 
 	rawConn, err := net.DialTimeout("tcp", cfg.Server, 15*time.Second)
@@ -96,41 +82,131 @@ func (c *Client) connect() (*mux.Session, error) {
 		return nil, fmt.Errorf("client: tcp dial: %w", err)
 	}
 
-	tlsConn := tls.Client(rawConn, tlsCfg)
-	tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := tlsConn.Handshake(); err != nil {
+	var transport net.Conn
+	if len(cfg.PSKBytes) == 32 {
+		transport, err = c.connectSpec(rawConn)
+	} else {
+		transport, err = c.connectLegacy(rawConn)
+	}
+	if err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("client: tls handshake: %w", err)
+		return nil, err
 	}
 
-	// Send MIRAGE auth message and wait for ACK.
+	log.Printf("miragec: session established")
+	if cfg.ClientPaddingSeedBytes != ([16]byte{}) {
+		recordConn, err := record.NewConn(transport, cfg.ClientPaddingSeedBytes[:])
+		if err != nil {
+			transport.Close()
+			return nil, fmt.Errorf("client: record conn: %w", err)
+		}
+		transport = recordConn
+	}
+
+	return mux.NewClientSession(transport), nil
+}
+
+func (c *Client) connectLegacy(rawConn net.Conn) (net.Conn, error) {
+	cfg := c.cfg
+	tlsCfg := &tls.Config{
+		ServerName:         cfg.SNI,
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
+	}
+	if len(cfg.CertPinBytes) > 0 {
+		tlsCfg.InsecureSkipVerify = true
+		tlsCfg.VerifyPeerCertificate = buildPinVerifier(cfg.CertPinBytes)
+	}
+
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("client: tls handshake: %w", err)
+	}
 	if err := auth.SendAndVerify(tlsConn, cfg.ServerPub, cfg.ShortIDBytes); err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("client: auth: %w", err)
 	}
-
-	tlsConn.SetDeadline(time.Time{}) // clear deadline
-	log.Printf("miragec: session established")
-
-	return mux.NewClientSession(tlsConn), nil
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
 }
 
-// waitForDeath blocks until the session is closed.
-// It probes by reading one byte from a dummy stream open — any error means dead.
-func waitForDeath(sess *mux.Session) {
-	// Open a "ping" stream that will immediately get RST from the server
-	// (unknown destination "0.0.0.0:1") — we just use it to detect death.
-	// Actually: just wait for a real Open to fail by blocking forever until
-	// the session's closeCh is signalled, which we can't access externally.
-	// Simple heuristic: try to open a stream every 30 seconds. If it fails,
-	// the session is dead.
-	for {
-		time.Sleep(30 * time.Second)
-		_, err := sess.OpenStream("127.0.0.1:1")
-		if err != nil {
-			return
-		}
+func (c *Client) connectSpec(rawConn net.Conn) (net.Conn, error) {
+	cfg := c.cfg
+	utlsCfg := &utls.Config{
+		ServerName: cfg.SNI,
+		MinVersion: tls.VersionTLS13,
 	}
+	if len(cfg.CertPinBytes) > 0 {
+		utlsCfg.InsecureSkipVerify = true
+		utlsCfg.VerifyPeerCertificate = buildPinVerifier(cfg.CertPinBytes)
+	}
+
+	uconn := utls.UClient(rawConn, utlsCfg, utls.HelloChrome_Auto)
+	_ = uconn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := uconn.BuildHandshakeState(); err != nil {
+		return nil, fmt.Errorf("client: build utls state: %w", err)
+	}
+
+	var clientRandom [32]byte
+	if _, err := rand.Read(clientRandom[:]); err != nil {
+		return nil, fmt.Errorf("client: random: %w", err)
+	}
+	if err := uconn.SetClientRandom(clientRandom[:]); err != nil {
+		return nil, fmt.Errorf("client: set client random: %w", err)
+	}
+
+	uid, err := protocol.DeriveUID(cfg.PSKBytes)
+	if err != nil {
+		return nil, fmt.Errorf("client: derive uid: %w", err)
+	}
+	token, err := protocol.DeriveHMACToken(cfg.PSKBytes, protocol.TimeWindow(time.Now().Unix()), clientRandom)
+	if err != nil {
+		return nil, fmt.Errorf("client: derive token: %w", err)
+	}
+	sessionID := protocol.BuildSessionID(uid, token)
+	uconn.HandshakeState.Hello.SessionId = append([]byte(nil), sessionID[:]...)
+	if err := uconn.MarshalClientHello(); err != nil {
+		return nil, fmt.Errorf("client: marshal client hello: %w", err)
+	}
+	if err := uconn.Handshake(); err != nil {
+		return nil, fmt.Errorf("client: utls handshake: %w", err)
+	}
+	_ = uconn.SetDeadline(time.Time{})
+	return uconn, nil
+}
+
+func buildPinVerifier(pins [][]byte) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("pin verify: no server certificates")
+		}
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("pin verify: parse leaf: %w", err)
+		}
+		sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		for _, pin := range pins {
+			if len(pin) != len(sum) {
+				continue
+			}
+			match := true
+			for i := range pin {
+				if pin[i] != sum[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return nil
+			}
+		}
+		return fmt.Errorf("pin verify: SPKI pin mismatch")
+	}
+}
+
+func waitForDeath(sess *mux.Session) {
+	<-sess.Done()
 }
 
 // Relay copies bidirectionally between a SOCKS conn and a mux stream.
@@ -140,11 +216,11 @@ func Relay(socks net.Conn, st *mux.Stream) {
 
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(st, socks)
+		_, _ = io.Copy(st, socks)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(socks, st)
+		_, _ = io.Copy(socks, st)
 		done <- struct{}{}
 	}()
 	<-done

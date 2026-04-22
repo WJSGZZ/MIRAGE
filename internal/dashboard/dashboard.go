@@ -1,0 +1,1016 @@
+// Package dashboard serves the local web UI and REST API for miragec.
+package dashboard
+
+import (
+	"bufio"
+	"crypto/rand"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"miraged/internal/config"
+	"miraged/internal/daemon"
+	"miraged/internal/sysproxy"
+	"miraged/internal/uri"
+)
+
+//go:embed index.html
+var static embed.FS
+
+// SavedServer is one entry in servers.json.
+type SavedServer struct {
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	UserName           string `json:"userName,omitempty"`
+	Addr               string `json:"addr"`
+	PSK                string `json:"psk,omitempty"`
+	CertPin            string `json:"certPin,omitempty"`
+	ClientPaddingSeed  string `json:"clientPaddingSeed,omitempty"`
+	PubKeyBase64       string `json:"pubKeyBase64"`
+	SNI                string `json:"sni"`
+	ShortID            string `json:"shortId"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify"`
+	Listen             string `json:"listen"` // local SOCKS5 addr, default 127.0.0.1:1080
+}
+
+type State = stateResp
+type Diagnostics = diagnosticsResp
+type Conclusion = diagConclusion
+type ListenerStatus = listenerStatus
+type TestResult = testResult
+
+// Dashboard owns the HTTP mux, daemon, and persisted server list.
+type Dashboard struct {
+	mu       sync.Mutex
+	d        *daemon.Daemon
+	servers  []SavedServer
+	activeID string
+	file     string // path to servers.json
+	probeAddr string
+}
+
+// New loads servers.json from file (creating it if absent) and returns a Dashboard.
+func New(file string) *Dashboard {
+	dash := &Dashboard{
+		d:         &daemon.Daemon{},
+		file:      file,
+		probeAddr: "127.0.0.1:9099",
+	}
+	dash.load()
+	return dash
+}
+
+func (dash *Dashboard) SetProbeAddr(addr string) {
+	dash.mu.Lock()
+	dash.probeAddr = addr
+	dash.mu.Unlock()
+}
+
+// Handler returns the HTTP handler for the dashboard.
+func (dash *Dashboard) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", dash.serveIndex)
+	mux.HandleFunc("/api/state", dash.apiState)
+	mux.HandleFunc("/api/servers", dash.apiServers)
+	mux.HandleFunc("/api/import", dash.apiImport)
+	mux.HandleFunc("/api/connect", dash.apiConnect)
+	mux.HandleFunc("/api/disconnect", dash.apiDisconnect)
+	mux.HandleFunc("/api/diagnostics", dash.apiDiagnostics)
+	mux.HandleFunc("/api/launch", dash.apiLaunch)
+	mux.HandleFunc("/api/winhttp/apply", dash.apiApplyWinHTTP)
+	mux.HandleFunc("/api/servers/", dash.apiDeleteServer)
+	return withCORS(mux)
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (dash *Dashboard) serveIndex(w http.ResponseWriter, r *http.Request) {
+	data, _ := static.ReadFile("index.html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
+type stateResp struct {
+	Running    bool   `json:"running"`
+	Socks5     string `json:"socks5"`     // empty when not running
+	HTTP       string `json:"http"`       // empty when not running
+	EnvHTTP    string `json:"envHttp"`    // recommended HTTP(S)_PROXY value
+	EnvALL     string `json:"envAll"`     // recommended ALL_PROXY value
+	EnvNote    string `json:"envNote"`    // note for apps that read env at startup
+	ProxyScope string `json:"proxyScope"` // summary of what was applied on connect
+	CaptureGap string `json:"captureGap"` // why some apps can still bypass the proxy
+	ActiveID   string `json:"activeId"`   // empty when not running
+}
+
+func (dash *Dashboard) apiState(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, dash.currentState())
+}
+
+func (dash *Dashboard) State() State {
+	return dash.currentState()
+}
+
+func (dash *Dashboard) apiServers(w http.ResponseWriter, r *http.Request) {
+	dash.mu.Lock()
+	list := make([]SavedServer, len(dash.servers))
+	copy(list, dash.servers)
+	dash.mu.Unlock()
+	jsonOK(w, list)
+}
+
+func (dash *Dashboard) Servers() []SavedServer {
+	dash.mu.Lock()
+	defer dash.mu.Unlock()
+	list := make([]SavedServer, len(dash.servers))
+	copy(list, dash.servers)
+	return list
+}
+
+type importReq struct {
+	URI    string `json:"uri"`
+	Listen string `json:"listen"` // optional override
+}
+
+func (dash *Dashboard) apiImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req importReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	srv, err := uri.Decode(req.URI)
+	if err != nil {
+		jsonErr(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	listen := req.Listen
+	if listen == "" {
+		listen = "127.0.0.1:1080"
+	}
+
+	id, _ := randomHex(4)
+	saved := SavedServer{
+		ID:                 id,
+		Name:               srv.Name,
+		UserName:           srv.UserName,
+		Addr:               srv.Addr,
+		PSK:                srv.PSKBase64,
+		CertPin:            srv.CertPinBase64,
+		ClientPaddingSeed:  srv.PaddingSeedBase64,
+		PubKeyBase64:       srv.PubKeyBase64,
+		SNI:                srv.SNI,
+		ShortID:            srv.ShortID,
+		InsecureSkipVerify: srv.InsecureSkipVerify,
+		Listen:             listen,
+	}
+	if saved.Name == "" {
+		saved.Name = srv.Addr
+	}
+
+	dash.mu.Lock()
+	dash.servers = append(dash.servers, saved)
+	dash.save()
+	dash.mu.Unlock()
+
+	jsonOK(w, saved)
+}
+
+func (dash *Dashboard) ImportURI(rawURI, listen string) (SavedServer, error) {
+	srv, err := uri.Decode(rawURI)
+	if err != nil {
+		return SavedServer{}, err
+	}
+	if listen == "" {
+		listen = "127.0.0.1:1080"
+	}
+	id, _ := randomHex(4)
+	saved := SavedServer{
+		ID:                 id,
+		Name:               srv.Name,
+		UserName:           srv.UserName,
+		Addr:               srv.Addr,
+		PSK:                srv.PSKBase64,
+		CertPin:            srv.CertPinBase64,
+		ClientPaddingSeed:  srv.PaddingSeedBase64,
+		PubKeyBase64:       srv.PubKeyBase64,
+		SNI:                srv.SNI,
+		ShortID:            srv.ShortID,
+		InsecureSkipVerify: srv.InsecureSkipVerify,
+		Listen:             listen,
+	}
+	if saved.Name == "" {
+		saved.Name = srv.Addr
+	}
+
+	dash.mu.Lock()
+	dash.servers = append(dash.servers, saved)
+	dash.save()
+	dash.mu.Unlock()
+	return saved, nil
+}
+
+type connectReq struct {
+	ID string `json:"id"`
+}
+
+func (dash *Dashboard) apiConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req connectReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	dash.mu.Lock()
+	var found *SavedServer
+	for i := range dash.servers {
+		if dash.servers[i].ID == req.ID {
+			found = &dash.servers[i]
+			break
+		}
+	}
+	dash.mu.Unlock()
+
+	if found == nil {
+		jsonErr(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	cfg := &config.ClientConfig{
+		Name:               found.Name,
+		Listen:             found.Listen,
+		LocalSocks5:        found.Listen,
+		Server:             found.Addr,
+		PSK:                found.PSK,
+		ServerPubKey:       found.PubKeyBase64,
+		SNI:                found.SNI,
+		CertPin:            found.CertPin,
+		ClientPaddingSeed:  found.ClientPaddingSeed,
+		ShortID:            found.ShortID,
+		InsecureSkipVerify: found.InsecureSkipVerify,
+	}
+	if err := config.ParseClientFields(cfg); err != nil {
+		jsonErr(w, "config error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := dash.d.Start(cfg); err != nil {
+		jsonErr(w, "start failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	dash.mu.Lock()
+	dash.activeID = found.ID
+	dash.mu.Unlock()
+
+	sysproxy.Set(dash.d.HTTPListen(), dash.d.SocksListen())
+	log.Printf("dashboard: connected to %s via HTTP %s and SOCKS5 %s", found.Addr, dash.d.HTTPListen(), dash.d.SocksListen())
+	jsonOK(w, dash.currentState())
+}
+
+func (dash *Dashboard) Connect(id string) (State, error) {
+	dash.mu.Lock()
+	var found *SavedServer
+	for i := range dash.servers {
+		if dash.servers[i].ID == id {
+			found = &dash.servers[i]
+			break
+		}
+	}
+	dash.mu.Unlock()
+	if found == nil {
+		return State{}, fmt.Errorf("server not found")
+	}
+
+	cfg := &config.ClientConfig{
+		Name:               found.Name,
+		Listen:             found.Listen,
+		LocalSocks5:        found.Listen,
+		Server:             found.Addr,
+		PSK:                found.PSK,
+		ServerPubKey:       found.PubKeyBase64,
+		SNI:                found.SNI,
+		CertPin:            found.CertPin,
+		ClientPaddingSeed:  found.ClientPaddingSeed,
+		ShortID:            found.ShortID,
+		InsecureSkipVerify: found.InsecureSkipVerify,
+	}
+	if err := config.ParseClientFields(cfg); err != nil {
+		return State{}, fmt.Errorf("config error: %w", err)
+	}
+	if err := dash.d.Start(cfg); err != nil {
+		return State{}, fmt.Errorf("start failed: %w", err)
+	}
+
+	dash.mu.Lock()
+	dash.activeID = found.ID
+	dash.mu.Unlock()
+	sysproxy.Set(dash.d.HTTPListen(), dash.d.SocksListen())
+	log.Printf("dashboard: connected to %s via HTTP %s and SOCKS5 %s", found.Addr, dash.d.HTTPListen(), dash.d.SocksListen())
+	return dash.currentState(), nil
+}
+
+func (dash *Dashboard) apiDisconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	dash.d.Stop()
+	sysproxy.Clear()
+	dash.mu.Lock()
+	dash.activeID = ""
+	dash.mu.Unlock()
+	log.Printf("dashboard: disconnected")
+	jsonOK(w, stateResp{})
+}
+
+func (dash *Dashboard) Disconnect() {
+	dash.d.Stop()
+	sysproxy.Clear()
+	dash.mu.Lock()
+	dash.activeID = ""
+	dash.mu.Unlock()
+	log.Printf("dashboard: disconnected")
+}
+
+func (dash *Dashboard) apiApplyWinHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	httpAddr := dash.d.HTTPListen()
+	if httpAddr == "" {
+		jsonErr(w, "proxy not running", http.StatusBadRequest)
+		return
+	}
+	if err := sysproxy.ApplyWinHTTPElevated(httpAddr); err != nil {
+		jsonErr(w, "elevated WinHTTP apply failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	time.Sleep(250 * time.Millisecond)
+	jsonOK(w, map[string]interface{}{
+		"ok":     true,
+		"http":   httpAddr,
+		"system": sysproxy.SnapshotState(),
+	})
+}
+
+func (dash *Dashboard) ApplyWinHTTP() (Diagnostics, error) {
+	httpAddr := dash.d.HTTPListen()
+	if httpAddr == "" {
+		return Diagnostics{}, fmt.Errorf("proxy not running")
+	}
+	if err := sysproxy.ApplyWinHTTPElevated(httpAddr); err != nil {
+		return Diagnostics{}, fmt.Errorf("elevated WinHTTP apply failed: %w", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	return dash.Diagnostics("https://api.openai.com"), nil
+}
+
+type diagnosticsResp struct {
+	Timestamp   string            `json:"timestamp"`
+	State       stateResp         `json:"state"`
+	System      sysproxy.Snapshot `json:"system"`
+	Listeners   []listenerStatus  `json:"listeners"`
+	Tests       []testResult      `json:"tests"`
+	Conclusions []diagConclusion  `json:"conclusions"`
+}
+
+type launchReq struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
+type diagConclusion struct {
+	Level   string `json:"level"`
+	Title   string `json:"title"`
+	Detail  string `json:"detail"`
+	Channel string `json:"channel,omitempty"`
+}
+
+type listenerStatus struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+}
+
+type testResult struct {
+	Name     string `json:"name"`
+	Target   string `json:"target"`
+	Via      string `json:"via"`
+	Success  bool   `json:"success"`
+	Detail   string `json:"detail"`
+	Duration string `json:"duration"`
+}
+
+func (dash *Dashboard) apiDiagnostics(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	jsonOK(w, dash.Diagnostics(target))
+}
+
+func (dash *Dashboard) Diagnostics(target string) Diagnostics {
+	state := dash.currentState()
+	dash.mu.Lock()
+	probeAddr := dash.probeAddr
+	dash.mu.Unlock()
+	resp := diagnosticsResp{
+		Timestamp: time.Now().Format(time.RFC3339),
+		State:     state,
+		System:    sysproxy.SnapshotState(),
+	}
+	if probeAddr != "" {
+		resp.Listeners = append(resp.Listeners, probeListener("dashboard", probeAddr))
+	}
+	if state.Socks5 != "" {
+		resp.Listeners = append(resp.Listeners, probeListener("socks5", state.Socks5))
+	}
+	if state.HTTP != "" {
+		resp.Listeners = append(resp.Listeners, probeListener("http", state.HTTP))
+	}
+	if strings.TrimSpace(target) == "" {
+		target = "https://example.com"
+	}
+	resp.Tests = []testResult{
+		httpProxyTest("http-proxy", state.HTTP, target),
+		socksProxyTest("socks5-proxy", state.Socks5, target),
+	}
+	resp.Conclusions = diagnose(resp)
+	return resp
+}
+
+func (dash *Dashboard) apiDeleteServer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "DELETE required", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/servers/")
+	if id == "" {
+		jsonErr(w, "missing id", http.StatusBadRequest)
+		return
+	}
+
+	dash.mu.Lock()
+	defer dash.mu.Unlock()
+	idx := -1
+	for i, s := range dash.servers {
+		if s.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		jsonErr(w, "not found", http.StatusNotFound)
+		return
+	}
+	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
+	dash.save()
+
+	if dash.activeID == id {
+		dash.d.Stop()
+		sysproxy.Clear()
+		dash.activeID = ""
+	}
+	jsonOK(w, map[string]bool{"ok": true})
+}
+
+func (dash *Dashboard) apiLaunch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req launchReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Command) == "" {
+		jsonErr(w, "command is required", http.StatusBadRequest)
+		return
+	}
+	info, err := dash.LaunchWithProxy(req.Command, req.Args)
+	if err != nil {
+		jsonErr(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, info)
+}
+
+func (dash *Dashboard) DeleteServer(id string) error {
+	if id == "" {
+		return fmt.Errorf("missing id")
+	}
+	dash.mu.Lock()
+	defer dash.mu.Unlock()
+	idx := -1
+	for i, s := range dash.servers {
+		if s.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("not found")
+	}
+	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
+	dash.save()
+	if dash.activeID == id {
+		dash.d.Stop()
+		sysproxy.Clear()
+		dash.activeID = ""
+	}
+	return nil
+}
+
+func (dash *Dashboard) LaunchWithProxy(command string, args []string) (map[string]interface{}, error) {
+	state := dash.currentState()
+	if !state.Running || state.HTTP == "" || state.Socks5 == "" {
+		return nil, fmt.Errorf("mirage is not connected")
+	}
+
+	cmd := exec.Command(command, args...)
+	cmd.Env = append(os.Environ(),
+		"HTTP_PROXY="+state.EnvHTTP,
+		"HTTPS_PROXY="+state.EnvHTTP,
+		"ALL_PROXY="+state.EnvALL,
+		"NO_PROXY=127.0.0.1,localhost,::1",
+	)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("launch failed: %w", err)
+	}
+
+	log.Printf("dashboard: launched %s with MIRAGE proxy env", command)
+	return map[string]interface{}{
+		"ok":        true,
+		"command":   command,
+		"args":      args,
+		"pid":       cmd.Process.Pid,
+		"httpProxy": state.EnvHTTP,
+		"allProxy":  state.EnvALL,
+	}, nil
+}
+
+func (dash *Dashboard) load() {
+	data, err := os.ReadFile(dash.file)
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(data, &dash.servers)
+}
+
+func (dash *Dashboard) save() {
+	data, err := json.MarshalIndent(dash.servers, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(dash.file, data, 0600)
+}
+
+func jsonOK(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func jsonErr(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	return hex.EncodeToString(b), err
+}
+
+func (dash *Dashboard) currentState() stateResp {
+	dash.mu.Lock()
+	activeID := dash.activeID
+	dash.mu.Unlock()
+
+	resp := stateResp{
+		Running:    dash.d.Running(),
+		Socks5:     dash.d.SocksListen(),
+		HTTP:       dash.d.HTTPListen(),
+		EnvHTTP:    "http://" + dash.d.HTTPListen(),
+		EnvALL:     "socks5://" + dash.d.SocksListen(),
+		EnvNote:    "Apps already open may need a restart to pick up proxy environment variables.",
+		ProxyScope: "MIRAGE applies Windows system proxy settings and user proxy environment variables, then checks whether WinHTTP also picked them up.",
+		CaptureGap: "Apps that ignore WinINet, WinHTTP, and proxy environment variables can still bypass MIRAGE until TUN or service mode is added.",
+		ActiveID:   activeID,
+	}
+	if !resp.Running {
+		resp.EnvHTTP = ""
+		resp.EnvALL = ""
+		resp.EnvNote = ""
+		resp.ProxyScope = ""
+		resp.CaptureGap = ""
+	}
+	return resp
+}
+
+func probeListener(name, addr string) listenerStatus {
+	st := listenerStatus{Name: name, Address: addr}
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		st.Error = err.Error()
+		return st
+	}
+	st.Reachable = true
+	_ = conn.Close()
+	return st
+}
+
+func httpProxyTest(name, proxyAddr, target string) testResult {
+	res := testResult{Name: name, Target: target, Via: proxyAddr}
+	if proxyAddr == "" {
+		res.Detail = "proxy not running"
+		return res
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	host := u.Host
+	if host == "" {
+		res.Detail = "target missing host"
+		return res
+	}
+	if !strings.Contains(host, ":") {
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", proxyAddr, 4*time.Second)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: host},
+		Host:   host,
+		Header: make(http.Header),
+	}
+	if err := req.Write(conn); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	res.Duration = time.Since(start).String()
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	defer resp.Body.Close()
+	res.Success = resp.StatusCode >= 200 && resp.StatusCode < 300
+	res.Detail = fmt.Sprintf("CONNECT %s -> HTTP %d", host, resp.StatusCode)
+	return res
+}
+
+func socksProxyTest(name, proxyAddr, target string) testResult {
+	res := testResult{Name: name, Target: target, Via: proxyAddr}
+	if proxyAddr == "" {
+		res.Detail = "proxy not running"
+		return res
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	host := u.Host
+	if host == "" {
+		res.Detail = "target missing host"
+		return res
+	}
+	if !strings.Contains(host, ":") {
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", proxyAddr, 4*time.Second)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		res.Detail = fmt.Sprintf("handshake reply %v", reply)
+		return res
+	}
+
+	hostName, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	portNum, err := strconv.Atoi(portStr)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(hostName))}
+	req = append(req, []byte(hostName)...)
+	req = append(req, byte(portNum>>8), byte(portNum))
+	if _, err := conn.Write(req); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	if head[1] != 0x00 {
+		res.Detail = fmt.Sprintf("connect reply 0x%02x", head[1])
+		return res
+	}
+	switch head[3] {
+	case 0x01:
+		_, err = io.ReadFull(conn, make([]byte, 6))
+	case 0x03:
+		var l [1]byte
+		if _, err = io.ReadFull(conn, l[:]); err == nil {
+			_, err = io.ReadFull(conn, make([]byte, int(l[0])+2))
+		}
+	case 0x04:
+		_, err = io.ReadFull(conn, make([]byte, 18))
+	}
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	res.Success = true
+	res.Duration = time.Since(start).String()
+	res.Detail = "SOCKS connect ok"
+	return res
+}
+
+func diagnose(resp diagnosticsResp) []diagConclusion {
+	var out []diagConclusion
+
+	listenerOK := map[string]bool{}
+	for _, item := range resp.Listeners {
+		listenerOK[item.Name] = item.Reachable
+	}
+	testOK := map[string]bool{}
+	for _, item := range resp.Tests {
+		testOK[item.Name] = item.Success
+	}
+
+	if !resp.State.Running {
+		out = append(out, diagConclusion{
+			Level:  "warn",
+			Title:  "MIRAGE is not connected",
+			Detail: "The local proxy listeners are idle until a server is connected.",
+		})
+		return out
+	}
+
+	if !listenerOK["socks5"] || !listenerOK["http"] {
+		out = append(out, diagConclusion{
+			Level:  "error",
+			Title:  "Local listeners are incomplete",
+			Detail: "If either the HTTP or SOCKS listener is unreachable, some applications will bypass MIRAGE completely.",
+		})
+	}
+
+	if !testOK["http-proxy"] || !testOK["socks5-proxy"] {
+		out = append(out, diagConclusion{
+			Level:  "error",
+			Title:  "Proxy transport is not fully healthy",
+			Detail: "At least one local proxy path cannot establish outbound connectivity. Apps using that channel will fail even if the UI shows connected.",
+		})
+	} else {
+		out = append(out, diagConclusion{
+			Level:  "ok",
+			Title:  "Core proxy path is working",
+			Detail: "Both local HTTP CONNECT and SOCKS5 tunnel tests succeeded, so MIRAGE can carry generic outbound traffic.",
+		})
+	}
+
+	sysEnabled := resp.System.ProxyEnable == "0x1" && resp.System.ProxyServer != ""
+	if sysEnabled {
+		out = append(out, diagConclusion{
+			Level:   "ok",
+			Title:   "Browser-style system proxy is active",
+			Detail:  "Apps that honor the Windows Internet Settings proxy should already be routed through MIRAGE.",
+			Channel: "WinINet",
+		})
+	} else {
+		out = append(out, diagConclusion{
+			Level:   "warn",
+			Title:   "Windows system proxy is not fully applied",
+			Detail:  "Browser-style applications may still go direct unless both ProxyEnable and ProxyServer are present.",
+			Channel: "WinINet",
+		})
+	}
+
+	winHTTPText := strings.ToLower(resp.System.WinHTTP)
+	winHTTPActive := winHTTPText != "" &&
+		!strings.Contains(winHTTPText, "direct access") &&
+		!strings.Contains(winHTTPText, "直接访问")
+	if winHTTPActive {
+		out = append(out, diagConclusion{
+			Level:   "ok",
+			Title:   "WinHTTP proxy is active",
+			Detail:  "Services and applications that rely on the WinHTTP stack should be able to pick up the MIRAGE HTTP proxy.",
+			Channel: "WinHTTP",
+		})
+	} else {
+		out = append(out, diagConclusion{
+			Level:   "warn",
+			Title:   "WinHTTP is still direct",
+			Detail:  "Programs that use the WinHTTP stack may bypass MIRAGE. On Windows this often means the update needs elevation or a helper service.",
+			Channel: "WinHTTP",
+		})
+	}
+
+	env := resp.System.Env
+	envOK := env["HTTP_PROXY"] != "" || env["HTTPS_PROXY"] != "" || env["ALL_PROXY"] != ""
+	if envOK {
+		out = append(out, diagConclusion{
+			Level:   "ok",
+			Title:   "Proxy environment variables are exported",
+			Detail:  "CLI tools and app backends that read proxy variables at process startup can use MIRAGE after restart.",
+			Channel: "Environment",
+		})
+	} else {
+		out = append(out, diagConclusion{
+			Level:   "warn",
+			Title:   "Process-level proxy variables are missing",
+			Detail:  "Apps that only honor HTTP_PROXY, HTTPS_PROXY, or ALL_PROXY at startup will not be captured until these variables exist.",
+			Channel: "Environment",
+		})
+	}
+
+	if testOK["http-proxy"] && testOK["socks5-proxy"] && sysEnabled && envOK && !winHTTPActive {
+		out = append(out, diagConclusion{
+			Level:  "warn",
+			Title:  "Remaining gap is above the transport layer",
+			Detail: "If a specific app still fails now, the likely issue is which proxy channel it honors at startup rather than whether MIRAGE can reach the target.",
+		})
+	}
+
+	if testOK["http-proxy"] && testOK["socks5-proxy"] {
+		out = append(out, diagConclusion{
+			Level:  "warn",
+			Title:  "Full software capture is not implemented yet",
+			Detail: "Some applications ignore WinINet, WinHTTP, and proxy environment variables entirely. MIRAGE still needs TUN or a service-level capture path to match the coverage of mature desktop proxy clients.",
+		})
+	}
+
+	return out
+}
+
+func FormatDiagnosticsText(data Diagnostics) string {
+	var b strings.Builder
+	b.WriteString("Snapshot\n")
+	b.WriteString(data.Timestamp)
+	b.WriteString("\n\n")
+
+	for _, item := range data.Conclusions {
+		b.WriteString(item.Title)
+		b.WriteString("\n")
+		b.WriteString(item.Level)
+		b.WriteString("\n")
+		b.WriteString(item.Detail)
+		b.WriteString("\n")
+		if item.Channel != "" {
+			b.WriteString(item.Channel)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	for _, item := range data.Listeners {
+		b.WriteString(item.Name)
+		b.WriteString(" listener\n")
+		if item.Reachable {
+			b.WriteString("OK\n")
+		} else {
+			b.WriteString("Check\n")
+		}
+		b.WriteString("Address\n")
+		b.WriteString(item.Address)
+		b.WriteString("\nStatus\n")
+		if item.Reachable {
+			b.WriteString("reachable\n\n")
+		} else {
+			b.WriteString(item.Error)
+			b.WriteString("\n\n")
+		}
+	}
+
+	b.WriteString("System proxy\n")
+	if data.System.ProxyServer != "" {
+		b.WriteString("OK\n")
+	} else {
+		b.WriteString("Check\n")
+	}
+	b.WriteString("ProxyEnable\n")
+	b.WriteString(blankIfEmpty(data.System.ProxyEnable))
+	b.WriteString("\nProxyServer\n")
+	b.WriteString(blankIfEmpty(data.System.ProxyServer))
+	b.WriteString("\nProxyOverride\n")
+	b.WriteString(blankIfEmpty(data.System.ProxyOverride))
+	b.WriteString("\nAutoDetect\n")
+	b.WriteString(blankIfEmpty(data.System.AutoDetect))
+	b.WriteString("\n\nWinHTTP\nValue\n")
+	b.WriteString(blankIfEmpty(data.System.WinHTTP))
+	b.WriteString("\n\nEnvironment\nHTTP_PROXY\n")
+	b.WriteString(blankIfEmpty(data.System.Env["HTTP_PROXY"]))
+	b.WriteString("\nHTTPS_PROXY\n")
+	b.WriteString(blankIfEmpty(data.System.Env["HTTPS_PROXY"]))
+	b.WriteString("\nALL_PROXY\n")
+	b.WriteString(blankIfEmpty(data.System.Env["ALL_PROXY"]))
+	b.WriteString("\nNO_PROXY\n")
+	b.WriteString(blankIfEmpty(data.System.Env["NO_PROXY"]))
+	b.WriteString("\n\n")
+
+	for _, test := range data.Tests {
+		b.WriteString(test.Name)
+		b.WriteString("\n")
+		if test.Success {
+			b.WriteString("OK\n")
+		} else {
+			b.WriteString("Check\n")
+		}
+		b.WriteString("Target\n")
+		b.WriteString(blankIfEmpty(test.Target))
+		b.WriteString("\nVia\n")
+		b.WriteString(blankIfEmpty(test.Via))
+		b.WriteString("\nDetail\n")
+		b.WriteString(blankIfEmpty(test.Detail))
+		b.WriteString("\nDuration\n")
+		b.WriteString(blankIfEmpty(test.Duration))
+		b.WriteString("\n\n")
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func blankIfEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(empty)"
+	}
+	return s
+}
