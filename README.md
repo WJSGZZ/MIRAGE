@@ -116,6 +116,56 @@ Run the server:
 ./miraged -c /path/to/config.json
 ```
 
+### One-command bootstrap
+
+You no longer need to manually stitch together `config.json`, `cert pin`, and the final `mirage://` link.
+
+Build first:
+
+```bash
+go build -o miraged ./cmd/miraged
+```
+
+Then run bootstrap:
+
+```bash
+./miraged -bootstrap -bootstrap-dir /opt/miraged -listen 0.0.0.0:443
+```
+
+That command will:
+
+- check whether the listen port is already occupied
+- auto-generate server config
+- auto-generate certificate and key
+- derive the final `cert pin`
+- auto-detect the public IP when possible
+- write:
+  - `/opt/miraged/config.json`
+  - `/opt/miraged/client.json`
+  - `/opt/miraged/mirage-cert.pem`
+  - `/opt/miraged/mirage-key.pem`
+- print the final importable `mirage://` URI
+
+Useful overrides:
+
+```bash
+./miraged -bootstrap \
+  -bootstrap-dir /opt/miraged \
+  -public-host YOUR_DOMAIN_OR_IP \
+  -listen 0.0.0.0:8443 \
+  -fallback www.microsoft.com:443 \
+  -sni www.microsoft.com \
+  -name my-vps-1 \
+  -user user1 \
+  -overwrite
+```
+
+To inspect whether a port is already occupied on Linux:
+
+```bash
+ss -ltnp | grep ':443'
+```
+
 ### Windows core
 
 Build from the repository root:
@@ -301,6 +351,56 @@ go build -o miraged ./cmd/miraged
 
 ```bash
 ./miraged -c /path/to/config.json
+```
+
+### 一键初始化
+
+现在不需要再手动拼 `config.json`、`cert pin` 和最终 `mirage://` 了。
+
+先编译：
+
+```bash
+go build -o miraged ./cmd/miraged
+```
+
+再执行一键初始化：
+
+```bash
+./miraged -bootstrap -bootstrap-dir /opt/miraged -listen 0.0.0.0:443
+```
+
+这个命令会自动：
+
+- 检查监听端口是否已被占用
+- 生成服务端配置
+- 生成证书和私钥
+- 计算最终 `cert pin`
+- 尽量自动探测公网 IP
+- 写出：
+  - `/opt/miraged/config.json`
+  - `/opt/miraged/client.json`
+  - `/opt/miraged/mirage-cert.pem`
+  - `/opt/miraged/mirage-key.pem`
+- 直接打印最终可导入的 `mirage://`
+
+常用覆盖参数：
+
+```bash
+./miraged -bootstrap \
+  -bootstrap-dir /opt/miraged \
+  -public-host 你的域名或公网IP \
+  -listen 0.0.0.0:8443 \
+  -fallback www.microsoft.com:443 \
+  -sni www.microsoft.com \
+  -name my-vps-1 \
+  -user user1 \
+  -overwrite
+```
+
+查看 Linux 上某个端口目前被谁占用：
+
+```bash
+ss -ltnp | grep ':443'
 ```
 
 ### Windows 本地核心
