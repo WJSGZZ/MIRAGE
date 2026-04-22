@@ -111,7 +111,7 @@ spec-defined architecture:
 ## Track I: Control Plane
 
 - `partial` Existing dashboard already covers some state/diagnostics flows.
-- `todo` Normalize control API to the spec paths:
+- `done` Normalize control API to the spec paths:
   - `/health`
   - `/version`
   - `/state`
@@ -121,14 +121,25 @@ spec-defined architecture:
   - `/disconnect`
   - `/reload-config`
   - `/logs`
+- `partial` Keep legacy `/api/*` routes alive while the desktop client migrates to spec-shaped endpoints.
+- `todo` Upgrade `/logs` from JSON snapshot to long-poll or SSE.
+- `done` Replace placeholder `/stats` counters with real traffic accounting.
 - `todo` Split core API from dashboard presentation API if needed.
 
 ## Track J: Desktop Client
 
-- `partial` Tauri shell scaffolding exists in `desktop/`.
-- `todo` Finish sidecar boot flow and dev/build validation.
-- `todo` Move from browser-like dashboard feel to desktop-first shell behavior.
-- `todo` Add tray, single-instance, startup options, and profile management.
+- `done` Native WPF client exists in `MirageClient.WPF/` and now compiles, launches, and auto-starts the local core.
+- `done` Add bilingual UI support:
+  - follow system language by default
+  - manual `zh-CN` / `en-US` switch in native settings
+- `partial` Make WPF the primary Windows startup/build/distribution path.
+- `partial` Add tray, single-instance, startup options, profile management, and native import/export flows.
+- `partial` Add system proxy policy management in the native client:
+  - off
+  - system
+  - manual
+  - pac
+- `partial` Remove remaining browser-first assumptions and stop treating the dashboard as the main client.
 
 ## Track K: TUN and UDP
 
@@ -144,7 +155,7 @@ spec-defined architecture:
 4. `todo` Swap custom mux for Yamux.
 5. `todo` Rewrite handshake to raw TCP + session_id auth + fallback.
 6. `todo` Switch client handshake to uTLS and pin-only trust.
-7. `todo` Stabilize control API and desktop shell.
+7. `partial` Stabilize control API and native desktop shell.
 
 ## Current Gap Snapshot
 
@@ -153,6 +164,9 @@ spec-defined architecture:
 - The server is now dual-stack during migration: spec `session_id` auth on the new path, legacy post-TLS auth still available for existing clients.
 - New `mirage://` links can now reach the spec client handshake path, but end-to-end runtime verification against a real MIRAGE server is still needed.
 - The server can now compute and print SPKI pin values, and the client will enforce SPKI pin matching when `cert_pin` is configured.
+- The dashboard/core API now exposes the spec-shaped control endpoints alongside the older `/api/*` compatibility surface.
+- The core now exposes real upload/download counters and per-second rates through `/stats`, so native clients can render traffic instead of placeholder cards.
+- A native WPF Windows client now builds and starts successfully, with Chinese/English localization, tray integration, copyable diagnostics, proxy mode settings, and automatic local core startup.
 - This means the migration foundation is in place, but the protocol implementation is not yet `1.0.2-draft` complete.
 
 ## Repository Mapping
@@ -175,5 +189,5 @@ spec-defined architecture:
   uTLS, session_id, pin verify, record.Conn, yamux client
 - `internal/dashboard/`:
   control API normalization and GUI-facing presentation
-- `desktop/`:
-  desktop shell and sidecar orchestration
+- `MirageClient.WPF/`:
+  primary native Windows client shell

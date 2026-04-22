@@ -15,11 +15,10 @@ servers.json
 # Go build cache
 go.sum
 
-# desktop dependencies and build outputs
-desktop/node_modules/
-desktop/src-tauri/target/
-desktop/src-tauri/binaries/
-
 # OS
 .DS_Store
 Thumbs.db
+
+# desktop build output
+**/bin/
+**/obj/

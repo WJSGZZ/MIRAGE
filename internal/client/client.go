@@ -22,6 +22,11 @@ import (
 	"miraged/internal/record"
 )
 
+type TrafficMeter interface {
+	AddUpload(int64)
+	AddDownload(int64)
+}
+
 // Client holds the state of one MIRAGE client instance.
 type Client struct {
 	cfg *config.ClientConfig
@@ -210,17 +215,23 @@ func waitForDeath(sess *mux.Session) {
 }
 
 // Relay copies bidirectionally between a SOCKS conn and a mux stream.
-func Relay(socks net.Conn, st *mux.Stream) {
+func Relay(socks net.Conn, st net.Conn, meter TrafficMeter) {
 	defer socks.Close()
 	defer st.Close()
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(st, socks)
+		n, _ := io.Copy(st, socks)
+		if meter != nil {
+			meter.AddUpload(n)
+		}
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(socks, st)
+		n, _ := io.Copy(socks, st)
+		if meter != nil {
+			meter.AddDownload(n)
+		}
 		done <- struct{}{}
 	}()
 	<-done

@@ -18,6 +18,7 @@ type Daemon struct {
 	lnSocks    net.Listener
 	lnHTTP     net.Listener
 	cli        *client.Client
+	stats      *Stats
 	running    bool
 	listenSocks string // e.g. "127.0.0.1:1080"
 	listenHTTP  string // e.g. "127.0.0.1:1081"
@@ -47,6 +48,10 @@ func (d *Daemon) Start(cfg *config.ClientConfig) error {
 	}
 
 	c := client.New(cfg)
+	if d.stats == nil {
+		d.stats = NewStats()
+	}
+	d.stats.Reset()
 	d.lnSocks = lnSocks
 	d.lnHTTP = lnHTTP
 	d.cli = c
@@ -54,8 +59,8 @@ func (d *Daemon) Start(cfg *config.ClientConfig) error {
 	d.listenSocks = cfg.Listen
 	d.listenHTTP = httpListen
 
-	go client.Serve(lnSocks, c)
-	go client.ServeHTTPProxy(lnHTTP, c)
+	go client.Serve(lnSocks, c, d.stats)
+	go client.ServeHTTPProxy(lnHTTP, c, d.stats)
 	return nil
 }
 
@@ -108,6 +113,15 @@ func (d *Daemon) HTTPListen() string {
 		return ""
 	}
 	return d.listenHTTP
+}
+
+func (d *Daemon) StatsSnapshot() Snapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stats == nil {
+		return NewStats().Snapshot()
+	}
+	return d.stats.Snapshot()
 }
 
 func nextPortAddr(addr string) (string, error) {

@@ -14,12 +14,13 @@ import (
 )
 
 type Snapshot struct {
-	ProxyEnable  string            `json:"proxyEnable"`
-	ProxyServer  string            `json:"proxyServer"`
-	ProxyOverride string           `json:"proxyOverride"`
-	AutoDetect   string            `json:"autoDetect"`
-	WinHTTP      string            `json:"winHttp"`
-	Env          map[string]string `json:"env"`
+	ProxyEnable   string            `json:"proxyEnable"`
+	ProxyServer   string            `json:"proxyServer"`
+	ProxyOverride string            `json:"proxyOverride"`
+	AutoConfigURL string            `json:"autoConfigUrl"`
+	AutoDetect    string            `json:"autoDetect"`
+	WinHTTP       string            `json:"winHttp"`
+	Env           map[string]string `json:"env"`
 }
 
 func SnapshotState() Snapshot {
@@ -27,6 +28,7 @@ func SnapshotState() Snapshot {
 		ProxyEnable:   queryReg(regPath, "ProxyEnable"),
 		ProxyServer:   queryReg(regPath, "ProxyServer"),
 		ProxyOverride: queryReg(regPath, "ProxyOverride"),
+		AutoConfigURL: queryReg(regPath, "AutoConfigURL"),
 		AutoDetect:    queryReg(regPath, "AutoDetect"),
 		WinHTTP:       queryWinHTTP(),
 		Env: map[string]string{
@@ -42,11 +44,16 @@ func queryReg(path, value string) string {
 	out, err := exec.Command("reg", "query", path, "/v", value).CombinedOutput()
 	text := decodeWindowsText(out)
 	if err != nil {
-		if strings.Contains(text, "unable to find") || strings.Contains(text, "找不到") || strings.Contains(text, "无法找到") {
+		lower := strings.ToLower(text)
+		if strings.Contains(lower, "unable to find") ||
+			strings.Contains(lower, "cannot find") ||
+			strings.Contains(text, "系统找不到") ||
+			strings.Contains(text, "找不到") {
 			return ""
 		}
 		return strings.TrimSpace(text)
 	}
+
 	lines := strings.Split(text, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -58,6 +65,7 @@ func queryReg(path, value string) string {
 			return strings.Join(fields[2:], " ")
 		}
 	}
+
 	return strings.TrimSpace(text)
 }
 

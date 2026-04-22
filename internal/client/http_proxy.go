@@ -11,10 +11,10 @@ import (
 )
 
 // ServeHTTPProxy serves an HTTP proxy listener backed by the MIRAGE client.
-func ServeHTTPProxy(ln net.Listener, c *Client) {
+func ServeHTTPProxy(ln net.Listener, c *Client, meter TrafficMeter) {
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handleHTTPProxy(w, r, c)
+			handleHTTPProxy(w, r, c, meter)
 		}),
 	}
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -22,15 +22,15 @@ func ServeHTTPProxy(ln net.Listener, c *Client) {
 	}
 }
 
-func handleHTTPProxy(w http.ResponseWriter, r *http.Request, c *Client) {
+func handleHTTPProxy(w http.ResponseWriter, r *http.Request, c *Client, meter TrafficMeter) {
 	if strings.EqualFold(r.Method, http.MethodConnect) {
-		handleHTTPConnect(w, r, c)
+		handleHTTPConnect(w, r, c, meter)
 		return
 	}
-	handleHTTPForward(w, r, c)
+	handleHTTPForward(w, r, c, meter)
 }
 
-func handleHTTPConnect(w http.ResponseWriter, r *http.Request, c *Client) {
+func handleHTTPConnect(w http.ResponseWriter, r *http.Request, c *Client, meter TrafficMeter) {
 	dest := canonicalAddr(r.Host, "443")
 	st, err := c.Dial(dest)
 	if err != nil {
@@ -75,10 +75,10 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, c *Client) {
 		}
 	}
 
-	Relay(conn, st)
+	Relay(conn, st, meter)
 }
 
-func handleHTTPForward(w http.ResponseWriter, r *http.Request, c *Client) {
+func handleHTTPForward(w http.ResponseWriter, r *http.Request, c *Client, meter TrafficMeter) {
 	dest := requestDest(r)
 	st, err := c.Dial(dest)
 	if err != nil {
@@ -87,6 +87,7 @@ func handleHTTPForward(w http.ResponseWriter, r *http.Request, c *Client) {
 		return
 	}
 	defer st.Close()
+	upstream := &meteredConn{Conn: st, meter: meter}
 
 	outReq := new(http.Request)
 	*outReq = *r
@@ -104,13 +105,13 @@ func handleHTTPForward(w http.ResponseWriter, r *http.Request, c *Client) {
 		outReq.URL.Host = ""
 	}
 
-	if err := outReq.Write(st); err != nil {
+	if err := outReq.Write(upstream); err != nil {
 		http.Error(w, "proxy write failed", http.StatusBadGateway)
 		log.Printf("miragec: http write %s: %v", dest, err)
 		return
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(st), r)
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), r)
 	if err != nil {
 		http.Error(w, "proxy read failed", http.StatusBadGateway)
 		log.Printf("miragec: http read %s: %v", dest, err)
@@ -123,6 +124,27 @@ func handleHTTPForward(w http.ResponseWriter, r *http.Request, c *Client) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("miragec: http body %s: %v", dest, err)
 	}
+}
+
+type meteredConn struct {
+	net.Conn
+	meter TrafficMeter
+}
+
+func (m *meteredConn) Read(p []byte) (int, error) {
+	n, err := m.Conn.Read(p)
+	if m.meter != nil {
+		m.meter.AddDownload(int64(n))
+	}
+	return n, err
+}
+
+func (m *meteredConn) Write(p []byte) (int, error) {
+	n, err := m.Conn.Write(p)
+	if m.meter != nil {
+		m.meter.AddUpload(int64(n))
+	}
+	return n, err
 }
 
 func requestDest(r *http.Request) string {

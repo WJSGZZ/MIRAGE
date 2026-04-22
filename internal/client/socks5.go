@@ -18,24 +18,24 @@ func ListenSocks5(addr string, c *Client) error {
 		return fmt.Errorf("socks5 listen %s: %w", addr, err)
 	}
 	log.Printf("miragec: SOCKS proxy listening on %s", addr)
-	Serve(ln, c)
+	Serve(ln, c, nil)
 	return nil
 }
 
 // Serve accepts connections from an existing listener and proxies them through c.
 // Returns when ln is closed.
-func Serve(ln net.Listener, c *Client) {
+func Serve(ln net.Listener, c *Client, meter TrafficMeter) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleProxyConn(conn, c)
+		go handleProxyConn(conn, c, meter)
 	}
 }
 
 // handleProxyConn handles one SOCKS client connection end-to-end.
-func handleProxyConn(conn net.Conn, c *Client) {
+func handleProxyConn(conn net.Conn, c *Client, meter TrafficMeter) {
 	defer conn.Close()
 
 	dest, reply, err := proxyHandshake(conn)
@@ -56,7 +56,7 @@ func handleProxyConn(conn net.Conn, c *Client) {
 		return
 	}
 
-	Relay(conn, st)
+	Relay(conn, st, meter)
 }
 
 func proxyHandshake(conn net.Conn) (dest string, reply func(byte) error, err error) {

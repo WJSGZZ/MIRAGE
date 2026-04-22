@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"io"
 	"log"
 	"net"
@@ -51,14 +52,25 @@ type Conclusion = diagConclusion
 type ListenerStatus = listenerStatus
 type TestResult = testResult
 
+const (
+	coreVersion     = "0.2.0-dev"
+	protocolVersion = "MIRAGE-SPEC-001 1.0.4-draft"
+)
+
 // Dashboard owns the HTTP mux, daemon, and persisted server list.
 type Dashboard struct {
-	mu       sync.Mutex
-	d        *daemon.Daemon
-	servers  []SavedServer
-	activeID string
-	file     string // path to servers.json
+	mu        sync.Mutex
+	d         *daemon.Daemon
+	servers   []SavedServer
+	activeID  string
+	file      string // path to servers.json
+	proxyFile string
+	proxyCfg  proxyConfig
 	probeAddr string
+	startedAt time.Time
+	logs      *memoryLog
+	lastProxyApplyAt    string
+	lastProxyApplyError string
 }
 
 // New loads servers.json from file (creating it if absent) and returns a Dashboard.
@@ -66,9 +78,13 @@ func New(file string) *Dashboard {
 	dash := &Dashboard{
 		d:         &daemon.Daemon{},
 		file:      file,
+		proxyFile: file + ".proxy.json",
 		probeAddr: "127.0.0.1:9099",
+		startedAt: time.Now(),
+		logs:      installMemoryLog(),
 	}
 	dash.load()
+	dash.loadProxyConfig()
 	return dash
 }
 
@@ -82,12 +98,26 @@ func (dash *Dashboard) SetProbeAddr(addr string) {
 func (dash *Dashboard) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", dash.serveIndex)
+	mux.HandleFunc("/health", dash.apiHealth)
+	mux.HandleFunc("/version", dash.apiVersion)
+	mux.HandleFunc("/state", dash.apiState)
+	mux.HandleFunc("/stats", dash.apiStats)
+	mux.HandleFunc("/profiles", dash.apiProfiles)
+	mux.HandleFunc("/connect", dash.apiConnectCompat)
+	mux.HandleFunc("/disconnect", dash.apiDisconnect)
+	mux.HandleFunc("/reload-config", dash.apiReloadConfig)
+	mux.HandleFunc("/logs", dash.apiLogs)
+	mux.HandleFunc("/proxy/config", dash.apiProxyConfig)
+	mux.HandleFunc("/proxy/reapply", dash.apiProxyReapply)
+	mux.HandleFunc("/proxy/pac", dash.apiProxyPAC)
+	mux.HandleFunc("/pac.js", dash.servePAC)
 	mux.HandleFunc("/api/state", dash.apiState)
 	mux.HandleFunc("/api/servers", dash.apiServers)
 	mux.HandleFunc("/api/import", dash.apiImport)
 	mux.HandleFunc("/api/connect", dash.apiConnect)
 	mux.HandleFunc("/api/disconnect", dash.apiDisconnect)
 	mux.HandleFunc("/api/diagnostics", dash.apiDiagnostics)
+	mux.HandleFunc("/api/diagnostics/text", dash.apiDiagnosticsText)
 	mux.HandleFunc("/api/launch", dash.apiLaunch)
 	mux.HandleFunc("/api/winhttp/apply", dash.apiApplyWinHTTP)
 	mux.HandleFunc("/api/servers/", dash.apiDeleteServer)
@@ -115,6 +145,7 @@ func (dash *Dashboard) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 type stateResp struct {
 	Running    bool   `json:"running"`
+	Status     string `json:"status"`
 	Socks5     string `json:"socks5"`     // empty when not running
 	HTTP       string `json:"http"`       // empty when not running
 	EnvHTTP    string `json:"envHttp"`    // recommended HTTP(S)_PROXY value
@@ -123,14 +154,66 @@ type stateResp struct {
 	ProxyScope string `json:"proxyScope"` // summary of what was applied on connect
 	CaptureGap string `json:"captureGap"` // why some apps can still bypass the proxy
 	ActiveID   string `json:"activeId"`   // empty when not running
+	ProxyMode  string `json:"proxyMode"`
+	ProxyApplied bool `json:"proxyApplied"`
+	ApplyWinHTTP bool `json:"applyWinHttp"`
+	ExportEnv bool `json:"exportEnv"`
+	PACURL string `json:"pacUrl"`
+	LastProxyApplyAt string `json:"lastProxyApplyAt"`
+	LastProxyApplyError string `json:"lastProxyApplyError"`
+}
+
+type versionResp struct {
+	Core     string `json:"core"`
+	Protocol string `json:"protocol"`
+}
+
+type statsResp struct {
+	Running          bool   `json:"running"`
+	ActiveProfile    string `json:"activeProfile"`
+	UptimeSeconds    int64  `json:"uptimeSeconds"`
+	Socks5Listen     string `json:"socks5Listen"`
+	HTTPListen       string `json:"httpListen"`
+	UploadBytes      int64  `json:"uploadBytes"`
+	DownloadBytes    int64  `json:"downloadBytes"`
+	UploadRateBps    int64  `json:"uploadRateBps"`
+	DownloadRateBps  int64  `json:"downloadRateBps"`
+}
+
+type profileResp struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Server    string `json:"server"`
+	SNI       string `json:"sni,omitempty"`
+	ProxyMode string `json:"proxyMode"`
+	Active    bool   `json:"active"`
 }
 
 func (dash *Dashboard) apiState(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, dash.currentState())
 }
 
+func (dash *Dashboard) apiHealth(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, map[string]interface{}{
+		"ok":      true,
+		"ready":   true,
+		"running": dash.d.Running(),
+	})
+}
+
+func (dash *Dashboard) apiVersion(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, versionResp{
+		Core:     coreVersion,
+		Protocol: protocolVersion,
+	})
+}
+
 func (dash *Dashboard) State() State {
 	return dash.currentState()
+}
+
+func (dash *Dashboard) apiProfiles(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, dash.Profiles())
 }
 
 func (dash *Dashboard) apiServers(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +230,24 @@ func (dash *Dashboard) Servers() []SavedServer {
 	list := make([]SavedServer, len(dash.servers))
 	copy(list, dash.servers)
 	return list
+}
+
+func (dash *Dashboard) Profiles() []profileResp {
+	dash.mu.Lock()
+	defer dash.mu.Unlock()
+	out := make([]profileResp, 0, len(dash.servers))
+	mode := dash.proxyCfg.Mode
+	for _, s := range dash.servers {
+		out = append(out, profileResp{
+			ID:        s.ID,
+			Name:      s.Name,
+			Server:    s.Addr,
+			SNI:       s.SNI,
+			ProxyMode: mode,
+			Active:    dash.activeID == s.ID && dash.d.Running(),
+		})
+	}
+	return out
 }
 
 type importReq struct {
@@ -292,9 +393,36 @@ func (dash *Dashboard) apiConnect(w http.ResponseWriter, r *http.Request) {
 	dash.activeID = found.ID
 	dash.mu.Unlock()
 
-	sysproxy.Set(dash.d.HTTPListen(), dash.d.SocksListen())
+	if err := dash.applyProxyPolicy(); err != nil {
+		jsonErr(w, "proxy apply failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	log.Printf("dashboard: connected to %s via HTTP %s and SOCKS5 %s", found.Addr, dash.d.HTTPListen(), dash.d.SocksListen())
 	jsonOK(w, dash.currentState())
+}
+
+func (dash *Dashboard) apiConnectCompat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Profile string `json:"profile"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Profile == "" {
+		jsonErr(w, "profile is required", http.StatusBadRequest)
+		return
+	}
+	state, err := dash.Connect(req.Profile)
+	if err != nil {
+		jsonErr(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, state)
 }
 
 func (dash *Dashboard) Connect(id string) (State, error) {
@@ -334,7 +462,9 @@ func (dash *Dashboard) Connect(id string) (State, error) {
 	dash.mu.Lock()
 	dash.activeID = found.ID
 	dash.mu.Unlock()
-	sysproxy.Set(dash.d.HTTPListen(), dash.d.SocksListen())
+	if err := dash.applyProxyPolicy(); err != nil {
+		return State{}, fmt.Errorf("proxy apply failed: %w", err)
+	}
 	log.Printf("dashboard: connected to %s via HTTP %s and SOCKS5 %s", found.Addr, dash.d.HTTPListen(), dash.d.SocksListen())
 	return dash.currentState(), nil
 }
@@ -345,20 +475,20 @@ func (dash *Dashboard) apiDisconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dash.d.Stop()
-	sysproxy.Clear()
 	dash.mu.Lock()
 	dash.activeID = ""
 	dash.mu.Unlock()
+	_ = dash.clearProxyAfterDisconnect()
 	log.Printf("dashboard: disconnected")
 	jsonOK(w, stateResp{})
 }
 
 func (dash *Dashboard) Disconnect() {
 	dash.d.Stop()
-	sysproxy.Clear()
 	dash.mu.Lock()
 	dash.activeID = ""
 	dash.mu.Unlock()
+	_ = dash.clearProxyAfterDisconnect()
 	log.Printf("dashboard: disconnected")
 }
 
@@ -394,6 +524,29 @@ func (dash *Dashboard) ApplyWinHTTP() (Diagnostics, error) {
 	}
 	time.Sleep(250 * time.Millisecond)
 	return dash.Diagnostics("https://api.openai.com"), nil
+}
+
+func (dash *Dashboard) apiStats(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, dash.Stats())
+}
+
+func (dash *Dashboard) Stats() statsResp {
+	state := dash.currentState()
+	dash.mu.Lock()
+	activeID := dash.activeID
+	dash.mu.Unlock()
+	snap := dash.d.StatsSnapshot()
+	return statsResp{
+		Running:         state.Running,
+		ActiveProfile:   activeID,
+		UptimeSeconds:   snap.UptimeSeconds,
+		Socks5Listen:    state.Socks5,
+		HTTPListen:      state.HTTP,
+		UploadBytes:     snap.UploadBytes,
+		DownloadBytes:   snap.DownloadBytes,
+		UploadRateBps:   snap.UploadRateBps,
+		DownloadRateBps: snap.DownloadRateBps,
+	}
 }
 
 type diagnosticsResp struct {
@@ -438,6 +591,12 @@ func (dash *Dashboard) apiDiagnostics(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, dash.Diagnostics(target))
 }
 
+func (dash *Dashboard) apiDiagnosticsText(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, FormatDiagnosticsText(dash.Diagnostics(target)))
+}
+
 func (dash *Dashboard) Diagnostics(target string) Diagnostics {
 	state := dash.currentState()
 	dash.mu.Lock()
@@ -480,7 +639,6 @@ func (dash *Dashboard) apiDeleteServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dash.mu.Lock()
-	defer dash.mu.Unlock()
 	idx := -1
 	for i, s := range dash.servers {
 		if s.ID == id {
@@ -494,13 +652,33 @@ func (dash *Dashboard) apiDeleteServer(w http.ResponseWriter, r *http.Request) {
 	}
 	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
 	dash.save()
-
+	needReapply := false
 	if dash.activeID == id {
 		dash.d.Stop()
-		sysproxy.Clear()
 		dash.activeID = ""
+		needReapply = true
+	}
+	dash.mu.Unlock()
+	if needReapply {
+		_ = dash.clearProxyAfterDisconnect()
 	}
 	jsonOK(w, map[string]bool{"ok": true})
+}
+
+func (dash *Dashboard) apiReloadConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	reloaded, err := dash.ReloadConfig()
+	if err != nil {
+		jsonErr(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]interface{}{
+		"ok":       true,
+		"profiles": reloaded,
+	})
 }
 
 func (dash *Dashboard) apiLaunch(w http.ResponseWriter, r *http.Request) {
@@ -530,7 +708,6 @@ func (dash *Dashboard) DeleteServer(id string) error {
 		return fmt.Errorf("missing id")
 	}
 	dash.mu.Lock()
-	defer dash.mu.Unlock()
 	idx := -1
 	for i, s := range dash.servers {
 		if s.ID == id {
@@ -543,12 +720,41 @@ func (dash *Dashboard) DeleteServer(id string) error {
 	}
 	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
 	dash.save()
+	needReapply := false
 	if dash.activeID == id {
 		dash.d.Stop()
-		sysproxy.Clear()
 		dash.activeID = ""
+		needReapply = true
+	}
+	dash.mu.Unlock()
+	if needReapply {
+		_ = dash.clearProxyAfterDisconnect()
 	}
 	return nil
+}
+
+func (dash *Dashboard) ReloadConfig() (int, error) {
+	data, err := os.ReadFile(dash.file)
+	if err != nil {
+		if errorsIs(err, fs.ErrNotExist) {
+			dash.mu.Lock()
+			dash.servers = nil
+			dash.mu.Unlock()
+			return 0, nil
+		}
+		return 0, fmt.Errorf("reload config: %w", err)
+	}
+	var list []SavedServer
+	if len(strings.TrimSpace(string(data))) != 0 {
+		if err := json.Unmarshal(data, &list); err != nil {
+			return 0, fmt.Errorf("reload config: %w", err)
+		}
+	}
+	dash.mu.Lock()
+	dash.servers = list
+	dash.mu.Unlock()
+	log.Printf("dashboard: reloaded %d profiles from %s", len(list), dash.file)
+	return len(list), nil
 }
 
 func (dash *Dashboard) LaunchWithProxy(command string, args []string) (map[string]interface{}, error) {
@@ -595,6 +801,22 @@ func (dash *Dashboard) save() {
 	_ = os.WriteFile(dash.file, data, 0600)
 }
 
+func (dash *Dashboard) apiLogs(w http.ResponseWriter, r *http.Request) {
+	since := strings.TrimSpace(r.URL.Query().Get("since"))
+	var sinceTime time.Time
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			jsonErr(w, "invalid since timestamp", http.StatusBadRequest)
+			return
+		}
+		sinceTime = t
+	}
+	jsonOK(w, map[string]interface{}{
+		"items": dash.logs.Since(sinceTime),
+	})
+}
+
 func jsonOK(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -615,10 +837,15 @@ func randomHex(n int) (string, error) {
 func (dash *Dashboard) currentState() stateResp {
 	dash.mu.Lock()
 	activeID := dash.activeID
+	proxyCfg := dash.proxyCfg
+	lastAt := dash.lastProxyApplyAt
+	lastErr := dash.lastProxyApplyError
 	dash.mu.Unlock()
+	system := sysproxy.SnapshotState()
 
 	resp := stateResp{
 		Running:    dash.d.Running(),
+		Status:     "idle",
 		Socks5:     dash.d.SocksListen(),
 		HTTP:       dash.d.HTTPListen(),
 		EnvHTTP:    "http://" + dash.d.HTTPListen(),
@@ -627,6 +854,16 @@ func (dash *Dashboard) currentState() stateResp {
 		ProxyScope: "MIRAGE applies Windows system proxy settings and user proxy environment variables, then checks whether WinHTTP also picked them up.",
 		CaptureGap: "Apps that ignore WinINet, WinHTTP, and proxy environment variables can still bypass MIRAGE until TUN or service mode is added.",
 		ActiveID:   activeID,
+		ProxyMode:  proxyCfg.Mode,
+		ProxyApplied: proxyModeApplied(proxyCfg.Mode, system),
+		ApplyWinHTTP: proxyCfg.ApplyWinHTTP,
+		ExportEnv: proxyCfg.ExportEnv,
+		PACURL: dash.proxyPACURL(),
+		LastProxyApplyAt: lastAt,
+		LastProxyApplyError: lastErr,
+	}
+	if resp.Running {
+		resp.Status = "connected"
 	}
 	if !resp.Running {
 		resp.EnvHTTP = ""
@@ -636,6 +873,80 @@ func (dash *Dashboard) currentState() stateResp {
 		resp.CaptureGap = ""
 	}
 	return resp
+}
+
+type logEntry struct {
+	Timestamp string `json:"timestamp"`
+	Message   string `json:"message"`
+}
+
+type memoryLog struct {
+	mu      sync.Mutex
+	lines   []logEntry
+	max     int
+	target  io.Writer
+}
+
+var installLogOnce sync.Once
+var sharedMemoryLog *memoryLog
+
+func installMemoryLog() *memoryLog {
+	installLogOnce.Do(func() {
+		sharedMemoryLog = &memoryLog{
+			max:    500,
+			target: log.Writer(),
+		}
+		log.SetOutput(io.MultiWriter(sharedMemoryLog.target, sharedMemoryLog))
+	})
+	return sharedMemoryLog
+}
+
+func (m *memoryLog) Write(p []byte) (int, error) {
+	text := strings.TrimSpace(string(p))
+	if text == "" {
+		return len(p), nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		m.lines = append(m.lines, logEntry{
+			Timestamp: time.Now().Format(time.RFC3339),
+			Message:   line,
+		})
+	}
+	if len(m.lines) > m.max {
+		m.lines = append([]logEntry(nil), m.lines[len(m.lines)-m.max:]...)
+	}
+	return len(p), nil
+}
+
+func (m *memoryLog) Since(since time.Time) []logEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if since.IsZero() {
+		out := make([]logEntry, len(m.lines))
+		copy(out, m.lines)
+		return out
+	}
+	var out []logEntry
+	for _, item := range m.lines {
+		t, err := time.Parse(time.RFC3339, item.Timestamp)
+		if err != nil {
+			continue
+		}
+		if !t.Before(since) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func errorsIs(err error, target error) bool {
+	return err != nil && target != nil && os.IsNotExist(err)
 }
 
 func probeListener(name, addr string) listenerStatus {
@@ -848,6 +1159,7 @@ func diagnose(resp diagnosticsResp) []diagConclusion {
 	}
 
 	sysEnabled := resp.System.ProxyEnable == "0x1" && resp.System.ProxyServer != ""
+	pacEnabled := strings.TrimSpace(resp.System.AutoConfigURL) != ""
 	if sysEnabled {
 		out = append(out, diagConclusion{
 			Level:   "ok",
@@ -861,6 +1173,15 @@ func diagnose(resp diagnosticsResp) []diagConclusion {
 			Title:   "Windows system proxy is not fully applied",
 			Detail:  "Browser-style applications may still go direct unless both ProxyEnable and ProxyServer are present.",
 			Channel: "WinINet",
+		})
+	}
+
+	if pacEnabled {
+		out = append(out, diagConclusion{
+			Level:   "ok",
+			Title:   "PAC proxy is active",
+			Detail:  "Windows has an AutoConfigURL configured, so PAC-aware applications should resolve through MIRAGE.",
+			Channel: "PAC",
 		})
 	}
 
@@ -972,6 +1293,8 @@ func FormatDiagnosticsText(data Diagnostics) string {
 	b.WriteString(blankIfEmpty(data.System.ProxyServer))
 	b.WriteString("\nProxyOverride\n")
 	b.WriteString(blankIfEmpty(data.System.ProxyOverride))
+	b.WriteString("\nAutoConfigURL\n")
+	b.WriteString(blankIfEmpty(data.System.AutoConfigURL))
 	b.WriteString("\nAutoDetect\n")
 	b.WriteString(blankIfEmpty(data.System.AutoDetect))
 	b.WriteString("\n\nWinHTTP\nValue\n")
