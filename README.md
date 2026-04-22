@@ -1,59 +1,128 @@
+# MIRAGE
+
 [English](#english) | [中文](#中文)
 
 ---
 
 <a name="english"></a>
 
-# MIRAGE
+## English
 
-A censorship-resistant proxy protocol with a dedicated client and server.
+### What MIRAGE is
 
-MIRAGE is distinct from Xray/V2Ray in three ways:
+MIRAGE is a censorship-resistant proxy project with:
 
-- Authentication uses BLAKE3 key derivation instead of HKDF-SHA256
-- The inner transport is a custom multiplexing protocol, not VLESS
-- Authentication happens after the TLS handshake, over the encrypted channel
+- a Linux server binary: `miraged`
+- a Windows client/core binary: `miragec`
+- a new desktop shell under [`desktop/`](desktop/README.md)
 
-Active probers who reach the server without valid credentials receive an HTTP 400 response, indistinguishable from a normal web server rejecting a bad request.
+The project is moving away from a browser-first control panel and toward a mainstream desktop-client architecture:
 
-## How it works
+- local Go proxy core
+- packaged desktop shell
+- tray behavior and desktop-owned UX
+- explicit system proxy, WinHTTP, and environment-proxy visibility
 
+### Current status
+
+MIRAGE already supports:
+
+- TLS-based client/server transport
+- local SOCKS5 and HTTP proxy listeners
+- Windows system proxy integration
+- WinHTTP apply flow
+- proxy environment export for tools that read `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+- desktop shell bootstrap with tray support
+- diagnostics for listener health and outbound proxy checks
+
+MIRAGE does **not** yet provide full traffic capture equivalent to mature TUN-based clients.  
+Some applications may still bypass the proxy if they ignore WinINet, WinHTTP, and proxy environment variables.
+
+### Architecture
+
+```text
+[Windows Desktop]
+  MIRAGE Desktop (Tauri shell)
+           |
+           v
+      miragec sidecar
+   HTTP :1081 / SOCKS5 :1080
+           |
+           v
+      TLS transport + auth + record layer + mux
+           |
+           v
+[Linux VPS]
+        miraged
+           |
+           v
+     destination
 ```
-[Windows PC]                          [VPS]
-  miragec.exe                         miraged
-  SOCKS5 :1080  <-->  TLS 1.3  <-->  mux server  <-->  destination
-                      BLAKE3 auth
-                      custom mux frames
+
+### Repo layout
+
+```text
+cmd/
+  miraged/                  server entry
+  miragec/                  client/core entry
+desktop/
+  app/                      desktop UI
+  src-tauri/                Tauri shell
+internal/
+  client/                   MIRAGE client, SOCKS5, HTTP proxy
+  server/                   MIRAGE server runtime
+  daemon/                   local client daemon lifecycle
+  dashboard/                local backend API and diagnostics
+  sysproxy/                 Windows proxy integration
+  protocol/                 key derivation and protocol helpers
+  record/                   framed record transport
+  mux/                      multiplexing session layer
+  tlspeek/                  ClientHello parsing helpers
+  replayconn/               replayable conn for server handshake path
+  uri/                      mirage:// link parsing
 ```
 
-1. The client exposes a local SOCKS5 proxy on `127.0.0.1:1080`.
-2. Each SOCKS5 request opens a mux stream over a shared TLS session to the server.
-3. The server dials the destination and relays traffic bidirectionally.
+### Server deployment
 
-## Server deployment
+Requirements:
 
-**Requirements:** Linux VPS, Go 1.23+, an open TCP port (default 8443).
+- Linux VPS
+- Go 1.24+
+- one open TCP port, for example `8443`
+
+Clone and build:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/MIRAGE /opt/miraged-src
-cd /opt/miraged-src
-go mod tidy
+git clone https://github.com/WJSGZZ/MIRAGE.git /opt/mirage-src
+cd /opt/mirage-src
 go build -o miraged ./cmd/miraged
+```
 
-mkdir -p /opt/miraged
-cp miraged /opt/miraged/
-cd /opt/miraged
+Generate a sample config:
 
-# Generate key pair and sample configs
+```bash
 ./miraged -genkey
 ```
 
-Copy the printed `config.json` block into `/opt/miraged/config.json`.
-Change `"listen"` to `"0.0.0.0:8443"` if port 443 is already in use.
+That command prints a server config template and a client config template.  
+For the legacy path you can still use the printed `serverPubKey` / `shortId` style config.  
+For the newer spec-aligned path, use fields such as:
+
+- `users[].psk`
+- `cert_pin`
+- `client_padding_seed`
+- `server_padding_seed`
+
+Run the server:
 
 ```bash
-# Create systemd service
-cat > /etc/systemd/system/miraged.service <<EOF
+./miraged -c /path/to/config.json
+```
+
+For systemd:
+
+```bash
+cat >/etc/systemd/system/miraged.service <<'EOF'
 [Unit]
 Description=MIRAGE proxy server
 After=network-online.target
@@ -61,161 +130,215 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/miraged
-ExecStart=/opt/miraged/miraged -c /opt/miraged/config.json
+WorkingDirectory=/opt/mirage
+ExecStart=/opt/mirage/miraged -c /opt/mirage/config.json
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+```
 
+Then:
+
+```bash
 systemctl daemon-reload
 systemctl enable miraged
 systemctl start miraged
-
-# Open firewall
-ufw allow 8443/tcp
 ```
 
-Verify: `journalctl -u miraged -f` should print `miraged: listening on 0.0.0.0:8443`.
+### Windows client/core
 
-## Client setup (Windows)
+Build the Go binaries from the repo root:
 
-**Requirements:** Go 1.23+ (only needed to build once).
-
-```bat
-cd MIRAGE
-build.bat
+```powershell
+cd D:\Folder\App\MIRAGE
+.\build.bat
 ```
 
-This produces `miragec.exe` (Windows) and `miraged` (Linux) in the project root.
+That produces:
 
-Copy the `client.json` block printed by `miraged -genkey` into `client.json`.
-Fill in:
+- `miragec.exe` for Windows
+- `miraged` / `miraged.exe` depending on your local build target
 
-| Field | Value |
-|---|---|
-| `server` | `YOUR_VPS_IP:8443` |
-| `serverPubKey` | public key from `miraged -genkey` |
-| `shortId` | shortId from `miraged -genkey` |
-| `insecureSkipVerify` | `true` (self-signed cert) or `false` (real cert) |
+Run the standalone core:
 
-```bat
-miragec.exe -c client.json
+```powershell
+.\miragec.exe --servers .\servers.json
 ```
 
-Then point your browser or system proxy to `SOCKS5 127.0.0.1:1080`.
+By default, the local backend exposes:
 
-## Desktop shell
+- dashboard/backend API on `127.0.0.1:9099`
+- SOCKS5 on `127.0.0.1:1080`
+- HTTP proxy on `127.0.0.1:1081`
 
-MIRAGE is moving to a desktop architecture similar to mature proxy clients:
+### Desktop shell
 
-- Go sidecar for the local proxy core
-- Desktop shell for the application window
-- One local dashboard served by the core and loaded inside the shell
+The desktop client lives under [`desktop/`](desktop/README.md).
 
-The new desktop shell lives in [desktop/README.md](desktop/README.md) and is
-based on Tauri rather than a hand-built Windows widget toolkit.
+Install frontend dependencies:
 
-## TLS certificates
-
-If `certFile` and `keyFile` are left empty in `config.json`, the server
-auto-generates a self-signed certificate on first run and saves it as
-`mirage-cert.pem` / `mirage-key.pem` next to the binary.
-
-For production, provide a real certificate (e.g. Let's Encrypt) and set
-`insecureSkipVerify: false` on the client.
-
-## File structure
-
-```
-cmd/
-  miraged/        server binary
-  miragec/        client binary
-internal/
-  auth/           BLAKE3 post-handshake authentication
-  mux/            custom inner multiplexing protocol
-  config/         server and client config loading
-  server/         TLS listener + auth + mux server
-  client/         mux client + SOCKS5 proxy
-  certutil/       self-signed TLS certificate generation
-config.example.json   server config template
-client.example.json   client config template
-build.bat             build script (Windows)
-install.sh            server install script (Linux)
+```powershell
+cd D:\Folder\App\MIRAGE\desktop
+npm.cmd install
 ```
 
-## Authentication wire format
+Start the desktop shell in development mode:
 
+```powershell
+npm.cmd run dev
 ```
-Client sends 80 bytes immediately after TLS handshake:
 
-  [0:32]  auth_pub   client ephemeral X25519 public key
-  [32:40] timestamp  big-endian int64 Unix seconds
-  [40:48] short_id   user shortId, zero-padded to 8 bytes
-  [48:80] mac        BLAKE3.derive_key("MIRAGE-v1-client-auth",
-                       ecdhe_secret || timestamp || short_id)
+Notes:
 
-Server replies with 1 byte:
-  0x00 = accepted, enter mux mode
-  (connection close = rejected)
-```
+- the Tauri shell launches `miragec` as a sidecar
+- the window now behaves like a desktop app, not just a browser tab
+- tray support and hide-to-tray are included
+- the desktop UI talks to the local backend API instead of redirecting the user to the old web dashboard
+
+### Proxy coverage
+
+Right now MIRAGE can cover several layers:
+
+- Windows system proxy
+- WinHTTP
+- process environment proxy
+- manual SOCKS5 / HTTP proxy usage
+
+This is enough for browsers and many tools, but not all applications.  
+If a program still bypasses MIRAGE, the missing piece is usually full capture mode, such as:
+
+- TUN
+- WFP/service mode
+- app-specific launch and injection strategies
+
+### Development notes
+
+- The repo now tracks the desktop shell source, but ignores heavy build artifacts.
+- Real local profile data such as `servers.json` is ignored and should not be committed.
+- The migration work is tracked in [`PROTOCOL_MIGRATION_TODO.md`](PROTOCOL_MIGRATION_TODO.md).
 
 ---
 
 <a name="中文"></a>
 
-# MIRAGE
+## 中文
 
-一个带有独立客户端和服务端的抗审查代理协议。
+### MIRAGE 是什么
 
-MIRAGE 与 Xray/V2Ray 的核心区别：
+MIRAGE 是一个抗审查代理项目，目前包含三部分：
 
-- 认证使用 BLAKE3 密钥派生，而非 HKDF-SHA256
-- 内层传输是自研多路复用协议，而非 VLESS
-- 认证在 TLS 握手完成后、在加密信道内进行
+- Linux 服务端二进制：`miraged`
+- Windows 客户端核心：`miragec`
+- 新的桌面客户端外壳：[`desktop/`](desktop/README.md)
 
-没有有效凭证的主动探测者连接到服务器后，只会收到 HTTP 400 响应，与普通 Web 服务器拒绝非法请求的行为完全一致。
+项目现在的方向已经不是“打开一个本地网页控制面板”了，而是逐步对标主流桌面代理客户端：
 
-## 工作原理
+- 本地 Go 代理核心
+- 桌面应用外壳
+- 托盘和桌面端交互
+- 清晰展示系统代理、WinHTTP、环境变量代理这些接管层
 
+### 当前能力
+
+MIRAGE 目前已经支持：
+
+- 基于 TLS 的客户端 / 服务端传输
+- 本地 SOCKS5 代理和 HTTP 代理
+- Windows 系统代理设置
+- WinHTTP 应用流程
+- 导出 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+- 带托盘的桌面端启动外壳
+- 本地监听、连通性、代理通道的诊断功能
+
+但它还**没有**做到成熟 TUN 客户端那种“几乎全局接管”。  
+如果某些软件既不认 WinINet，也不认 WinHTTP，也不认代理环境变量，它还是可能绕过 MIRAGE。
+
+### 架构概览
+
+```text
+[Windows 桌面端]
+   MIRAGE Desktop (Tauri)
+            |
+            v
+       miragec sidecar
+   HTTP :1081 / SOCKS5 :1080
+            |
+            v
+   TLS 传输 + 鉴权 + record 层 + mux
+            |
+            v
+[Linux VPS]
+         miraged
+            |
+            v
+         目标站点
 ```
-[Windows 电脑]                        [VPS]
-  miragec.exe                         miraged
-  SOCKS5 :1080  <-->  TLS 1.3  <-->  mux 服务端  <-->  目标网站
-                      BLAKE3 认证
-                      自研 mux 帧
+
+### 仓库结构
+
+```text
+cmd/
+  miraged/                  服务端入口
+  miragec/                  客户端核心入口
+desktop/
+  app/                      桌面 UI
+  src-tauri/                Tauri 外壳
+internal/
+  client/                   MIRAGE 客户端、SOCKS5、HTTP 代理
+  server/                   MIRAGE 服务端运行时
+  daemon/                   本地客户端代理生命周期
+  dashboard/                本地后端 API 与诊断
+  sysproxy/                 Windows 代理设置
+  protocol/                 密钥派生与协议辅助
+  record/                   分帧传输层
+  mux/                      多路复用层
+  tlspeek/                  ClientHello 解析
+  replayconn/               服务端握手重放连接
+  uri/                      mirage:// 链接解析
 ```
 
-1. 客户端在本机 `127.0.0.1:1080` 暴露一个 SOCKS5 代理。
-2. 每个 SOCKS5 请求通过复用的 TLS 会话向服务端开一条 mux stream。
-3. 服务端连接目标地址，双向中继流量。
+### 服务端部署
 
-## 服务端部署
+要求：
 
-**要求：** Linux VPS、Go 1.23+、一个开放的 TCP 端口（默认 8443）。
+- Linux VPS
+- Go 1.24+
+- 一个可开放的 TCP 端口，例如 `8443`
+
+克隆并编译：
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/MIRAGE /opt/miraged-src
-cd /opt/miraged-src
-go mod tidy
+git clone https://github.com/WJSGZZ/MIRAGE.git /opt/mirage-src
+cd /opt/mirage-src
 go build -o miraged ./cmd/miraged
+```
 
-mkdir -p /opt/miraged
-cp miraged /opt/miraged/
-cd /opt/miraged
+生成示例配置：
 
-# 生成密钥对和示例配置
+```bash
 ./miraged -genkey
 ```
 
-将输出的 `config.json` 内容写入 `/opt/miraged/config.json`。
-如果 443 端口已被占用，将 `"listen"` 改为 `"0.0.0.0:8443"`。
+这个命令会打印服务端和客户端配置模板。
+
+目前仓库同时兼容两种路径：
+
+- 旧的兼容配置：`serverPubKey` / `shortId`
+- 新的 spec 对齐配置：`psk` / `cert_pin` / `client_padding_seed` / `server_padding_seed`
+
+启动服务端：
 
 ```bash
-# 创建 systemd 服务
-cat > /etc/systemd/system/miraged.service <<EOF
+./miraged -c /path/to/config.json
+```
+
+如果你要挂成 systemd：
+
+```bash
+cat >/etc/systemd/system/miraged.service <<'EOF'
 [Unit]
 Description=MIRAGE proxy server
 After=network-online.target
@@ -223,89 +346,89 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/miraged
-ExecStart=/opt/miraged/miraged -c /opt/miraged/config.json
+WorkingDirectory=/opt/mirage
+ExecStart=/opt/mirage/miraged -c /opt/mirage/config.json
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+```
 
+然后执行：
+
+```bash
 systemctl daemon-reload
 systemctl enable miraged
 systemctl start miraged
-
-# 开放防火墙
-ufw allow 8443/tcp
 ```
 
-验证：`journalctl -u miraged -f` 应输出 `miraged: listening on 0.0.0.0:8443`。
+### Windows 客户端核心
 
-## 客户端使用（Windows）
+在仓库根目录编译：
 
-**要求：** Go 1.23+（只需编译一次）。
-
-```bat
-cd MIRAGE
-build.bat
+```powershell
+cd D:\Folder\App\MIRAGE
+.\build.bat
 ```
 
-生成 `miragec.exe`（Windows 客户端）和 `miraged`（Linux 服务端二进制）。
+构建完成后会得到客户端和服务端可执行文件。
 
-将 `miraged -genkey` 输出的 `client.json` 内容写入 `client.json`，填入：
+运行本地核心：
 
-| 字段 | 说明 |
-|---|---|
-| `server` | `VPS公网IP:8443` |
-| `serverPubKey` | `miraged -genkey` 输出的公钥 |
-| `shortId` | `miraged -genkey` 输出的 shortId |
-| `insecureSkipVerify` | 自签证书填 `true`，真实证书填 `false` |
-
-```bat
-miragec.exe -c client.json
+```powershell
+.\miragec.exe --servers .\servers.json
 ```
 
-将浏览器或系统代理设置为 `SOCKS5 127.0.0.1:1080` 即可使用。
+默认情况下会暴露：
 
-## TLS 证书
+- 本地后端 / 诊断接口：`127.0.0.1:9099`
+- SOCKS5：`127.0.0.1:1080`
+- HTTP 代理：`127.0.0.1:1081`
 
-`config.json` 中 `certFile` 和 `keyFile` 留空时，服务端首次运行会自动生成自签证书，
-保存为二进制同目录下的 `mirage-cert.pem` / `mirage-key.pem`。
+### 桌面客户端
 
-生产环境建议使用真实证书（如 Let's Encrypt），并将客户端 `insecureSkipVerify` 设为 `false`。
+桌面客户端说明在 [`desktop/README.md`](desktop/README.md)。
 
-## 文件结构
+安装依赖：
 
-```
-cmd/
-  miraged/        服务端二进制
-  miragec/        客户端二进制
-internal/
-  auth/           BLAKE3 认证（TLS 握手后）
-  mux/            自研内层多路复用协议
-  config/         配置加载
-  server/         TLS 监听 + 认证 + mux 服务端
-  client/         mux 客户端 + SOCKS5 代理
-  certutil/       自签 TLS 证书生成
-config.example.json   服务端配置模板
-client.example.json   客户端配置模板
-build.bat             编译脚本（Windows）
-install.sh            服务端安装脚本（Linux）
+```powershell
+cd D:\Folder\App\MIRAGE\desktop
+npm.cmd install
 ```
 
-## 认证报文格式
+开发模式启动：
 
+```powershell
+npm.cmd run dev
 ```
-TLS 握手完成后，客户端立即发送 80 字节：
 
-  [0:32]  auth_pub   客户端临时 X25519 公钥
-  [32:40] timestamp  大端 int64 Unix 秒时间戳
-  [40:48] short_id   用户 shortId，不足 8 字节补零
-  [48:80] mac        BLAKE3.derive_key("MIRAGE-v1-client-auth",
-                       ecdhe_secret || timestamp || short_id)
+现在桌面端的设计思路是：
 
-服务端回复 1 字节：
-  0x00 = 认证通过，进入 mux 模式
-  （关闭连接 = 认证失败）
-```
+- Tauri 外壳负责真正的桌面窗口
+- `miragec` 作为 sidecar 本地运行
+- 桌面 UI 直接请求本地 API
+- 不再把旧网页面板当作唯一主界面
+
+### 代理接管范围
+
+现在 MIRAGE 可以覆盖这些层：
+
+- Windows 系统代理
+- WinHTTP
+- 进程环境变量代理
+- 手动配置 SOCKS5 / HTTP 代理的软件
+
+这已经足够覆盖浏览器和不少工具，但还不是“完全体”。  
+如果某个程序仍然绕过 MIRAGE，通常缺的是更底层的流量接管能力，比如：
+
+- TUN
+- WFP / 服务模式
+- 针对特定应用的启动接管策略
+
+### 开发说明
+
+- 桌面端源码已经纳入仓库，但构建产物和依赖目录已忽略。
+- `servers.json` 这类本地真实节点配置不会提交到仓库。
+- 协议迁移计划见 [`PROTOCOL_MIGRATION_TODO.md`](PROTOCOL_MIGRATION_TODO.md)。
