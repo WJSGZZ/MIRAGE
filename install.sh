@@ -1,10 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ── Port selection ─────────────────────────────────────────────────────────────
+# Pass a port as the first argument (e.g. bash install.sh 443) or leave blank
+# for an interactive menu.
+select_port() {
+    if [[ -n "${1:-}" ]]; then
+        echo "$1"
+        return
+    fi
+    echo "" >&2
+    echo "  Select listen port:" >&2
+    echo "    1) 443   — standard HTTPS (recommended)" >&2
+    echo "    2) 8443  — alternative TLS port" >&2
+    echo "    3) 80    — HTTP port (bypasses some firewalls)" >&2
+    echo "    4) Custom" >&2
+    read -rp "  Choice [1]: " choice </dev/tty
+    case "${choice:-1}" in
+        1) echo 443 ;;
+        2) echo 8443 ;;
+        3) echo 80 ;;
+        4) read -rp "  Enter port: " p </dev/tty; echo "$p" ;;
+        *) echo 443 ;;
+    esac
+}
+
+PORT=$(select_port "${1:-}")
+LISTEN_ADDR=${LISTEN_ADDR:-"0.0.0.0:${PORT}"}
+
+# ── Tuneable defaults ──────────────────────────────────────────────────────────
 INSTALL_DIR=${INSTALL_DIR:-/opt/miraged}
 SERVICE=${SERVICE:-miraged}
 GO_VERSION=${GO_VERSION:-1.24.3}
-LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:443}
 PUBLIC_HOST=${PUBLIC_HOST:-}
 FALLBACK_ADDR=${FALLBACK_ADDR:-www.microsoft.com:443}
 SNI_NAME=${SNI_NAME:-www.microsoft.com}
@@ -12,6 +39,7 @@ PROFILE_NAME=${PROFILE_NAME:-my-vps-1}
 USER_NAME=${USER_NAME:-user1}
 ARCH=$(uname -m)
 
+# ── Go install helper ──────────────────────────────────────────────────────────
 need_go() {
     if ! command -v go >/dev/null 2>&1; then
         return 0
@@ -50,7 +78,7 @@ export PATH=/usr/local/go/bin:/snap/bin:$PATH
 echo "[+] $(go version)"
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-echo "[*] Building from ${SRC}..."
+echo "[*] Building from ${SRC} (listen: ${LISTEN_ADDR})..."
 cd "$SRC"
 go mod tidy
 go build -trimpath -ldflags="-s -w" -o miraged ./cmd/miraged
@@ -60,6 +88,7 @@ mkdir -p "$INSTALL_DIR"
 cp miraged "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/miraged"
 
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
 echo "[*] Running bootstrap..."
 BOOTSTRAP_ARGS=(
     -bootstrap
@@ -75,8 +104,14 @@ if [[ -n "$PUBLIC_HOST" ]]; then
     BOOTSTRAP_ARGS+=(-public-host "$PUBLIC_HOST")
 fi
 
-"$INSTALL_DIR/miraged" "${BOOTSTRAP_ARGS[@]}" | tee "$INSTALL_DIR/bootstrap.txt"
+BOOTSTRAP_OUT=$("$INSTALL_DIR/miraged" "${BOOTSTRAP_ARGS[@]}" 2>&1)
+echo "$BOOTSTRAP_OUT"
+echo "$BOOTSTRAP_OUT" > "$INSTALL_DIR/bootstrap.txt"
 
+# ── Extract and display the mirage:// URI ─────────────────────────────────────
+MIRAGE_URI=$(grep '^mirage://' "$INSTALL_DIR/bootstrap.txt" || true)
+
+# ── systemd service ───────────────────────────────────────────────────────────
 cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
 [Unit]
 Description=MIRAGE anti-censorship proxy
@@ -98,11 +133,28 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$SERVICE"
+systemctl start "$SERVICE"
 
+# ── Final output ───────────────────────────────────────────────────────────────
 echo
-echo "[+] Installed."
-echo "    Config:      ${INSTALL_DIR}/config.json"
-echo "    Client:      ${INSTALL_DIR}/client.json"
-echo "    Bootstrap:   ${INSTALL_DIR}/bootstrap.txt"
-echo "    Start with:  systemctl start ${SERVICE}"
-echo "    Logs with:   journalctl -u ${SERVICE} -f"
+echo "[+] Installed and started."
+echo "    Config  : ${INSTALL_DIR}/config.json"
+echo "    Client  : ${INSTALL_DIR}/client.json"
+echo "    Logs    : journalctl -u ${SERVICE} -f"
+echo
+
+if [[ -n "$MIRAGE_URI" ]]; then
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║            MIRAGE:// IMPORT TOKEN (save this!)              ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    printf "║  %s\n" "$MIRAGE_URI"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo
+    echo "  Use on Windows:"
+    echo "    miragec.exe -uri \"${MIRAGE_URI}\""
+    echo "  Or save to client.json and run:"
+    echo "    miragec.exe -c client.json"
+else
+    echo "[!] Could not extract mirage:// URI — check ${INSTALL_DIR}/bootstrap.txt"
+fi
+echo

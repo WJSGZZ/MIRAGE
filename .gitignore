@@ -11,6 +11,7 @@
 config.json
 client.json
 servers.json
+bootstrap.txt
 
 # Go build cache
 go.sum
