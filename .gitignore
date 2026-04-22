@@ -1,8 +1,8 @@
-# compiled binaries
-miraged
-miraged.exe
-miragec
-miragec.exe
+# compiled binaries at repo root
+/miraged
+/miraged.exe
+/miragec
+/miragec.exe
 
 # TLS certificates (auto-generated, must not be committed)
 *.pem
