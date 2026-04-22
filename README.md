@@ -8,235 +8,159 @@
 
 ### What MIRAGE is
 
-MIRAGE is a censorship-resistant proxy project with:
+MIRAGE is a censorship-resistant proxy. It disguises traffic as ordinary TLS by embedding auth material inside the ClientHello `session_id` field — no extra round-trips, no distinguishable handshake.
 
-- `miraged`: Linux server binary
-- `miragec`: Windows local proxy core
-- `MirageClient.WPF`: native Windows desktop client
+- **`miraged`** — Linux VPS server
+- **`miragec`** — Windows proxy core (headless CLI or dashboard)
 
-The current direction is a mainstream desktop-client architecture:
+---
 
-- Go transport and local proxy core
-- native Windows desktop UI
-- explicit local control API between UI and core
-- visible system proxy, WinHTTP, PAC, and environment coverage
+### VPS deployment (one command)
 
-### Current status
+```bash
+git clone https://github.com/WJSGZZ/MIRAGE.git
+cd MIRAGE
+bash install.sh 443
+```
 
-MIRAGE already supports:
+The script will:
 
-- TLS-based client/server transport
-- local SOCKS5 and HTTP proxy listeners
-- Windows system proxy integration
-- WinHTTP apply flow
-- user-level proxy environment export
-- spec-shaped control API endpoints
-- real traffic counters on `/stats`
-- native WPF desktop client with:
-  - Chinese and English UI
-  - follow-system-language default
-  - tray integration
-  - single-instance behavior
-  - profile import via `mirage://`
-  - proxy mode settings
-  - copyable diagnostics report
-  - automatic local core startup
+1. Install Go if needed
+2. Build `miraged` from source
+3. Auto-generate config, TLS certificate, PSK, and cert pin
+4. Auto-detect the public IP
+5. Print the final `mirage://` import token
+6. Install and start a systemd service
 
-MIRAGE still does **not** provide full capture equivalent to mature TUN-based clients. Software that ignores WinINet, WinHTTP, PAC, and proxy environment variables may still bypass MIRAGE until TUN or service mode is added.
+**Port options** — pass as first argument or use the interactive menu:
+
+```bash
+bash install.sh 443    # standard HTTPS port (recommended)
+bash install.sh 8443   # alternative TLS port
+bash install.sh 80     # HTTP port, bypasses some firewalls
+bash install.sh        # interactive menu
+```
+
+> Run as root. Make sure the chosen port is not already occupied.
+
+At the end you will see:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║            MIRAGE:// IMPORT TOKEN (save this!)              ║
+╠══════════════════════════════════════════════════════════════╣
+║  mirage://xxxx@1.2.3.4:443?sni=www.microsoft.com&cert_pin=...
+╚══════════════════════════════════════════════════════════════╝
+```
+
+Save that token — it encodes the server address, PSK, cert pin, and padding seed.
+
+---
+
+### Windows client
+
+Build from the repository root (requires Go):
+
+```powershell
+go build -o miragec.exe .\cmd\miragec
+```
+
+**Headless mode** (recommended — no UI, just the proxy):
+
+```powershell
+# from a mirage:// token
+.\miragec.exe -uri "mirage://xxxx@1.2.3.4:443?..."
+
+# from a client.json file
+.\miragec.exe -c client.json
+```
+
+This starts:
+- SOCKS5 proxy on `127.0.0.1:1080`
+- HTTP proxy on `127.0.0.1:1081`
+
+**Dashboard mode** (web UI at `http://127.0.0.1:9099`):
+
+```powershell
+.\miragec.exe
+```
+
+**Flag reference:**
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `-c path` | — | Load client.json, run headless |
+| `-uri mirage://...` | — | Parse URI directly, run headless |
+| `-socks5 addr` | from config | Override SOCKS5 listen address |
+| `-http addr` | from config | Override HTTP listen address |
+| `-servers path` | `servers.json` next to exe | Dashboard mode profile file |
+| `-no-browser` | false | Suppress browser auto-open |
+
+---
+
+### v2rayN integration
+
+Run `miragec.exe` in headless mode (SOCKS5 on `:1080`), then in v2rayN add a custom config:
+
+```json
+{
+  "inbounds": [
+    {"protocol": "socks", "port": 10808, "listen": "127.0.0.1",
+     "settings": {"auth": "noauth", "udp": false}}
+  ],
+  "outbounds": [
+    {"protocol": "socks",
+     "settings": {"servers": [{"address": "127.0.0.1", "port": 1080}]}}
+  ]
+}
+```
+
+v2rayN handles routing rules; MIRAGE handles the tunnel.
+
+---
 
 ### Architecture
 
-```text
-[Windows Desktop]
-   MirageClient.WPF
-          |
-          v
-  local control API :9099
-          |
-          v
-       miragec
- HTTP :1081 / SOCKS5 :1080
-          |
-          v
-  TLS transport + record layer + Yamux
-          |
-          v
-[Linux VPS]
-       miraged
-          |
-          v
-    destination
 ```
+[Windows]
+  miragec.exe
+  SOCKS5 :1080 / HTTP :1081
+       |
+       | TLS (uTLS Chrome profile)
+       | session_id = UID(4) + HMAC-token(28)
+       | record layer + Yamux
+       v
+[Linux VPS]
+  miraged
+       |
+       v
+  destination
+```
+
+---
 
 ### Repository layout
 
-```text
+```
 cmd/
-  miraged/                  server entry
-  miragec/                  client/core entry
-MirageClient.WPF/           native Windows desktop client
+  miraged/        server entry point
+  miragec/        client entry point (headless + dashboard)
 internal/
-  client/                   MIRAGE client, SOCKS5, HTTP proxy
-  server/                   MIRAGE server runtime
-  daemon/                   local client daemon lifecycle
-  dashboard/                local control API and diagnostics
-  sysproxy/                 Windows proxy integration
-  protocol/                 protocol helpers
-  record/                   framed record transport
-  tlspeek/                  ClientHello parsing helpers
-  replayconn/               replayable conn for server handshake path
-  uri/                      mirage:// link parsing
+  client/         TLS dial, SOCKS5, HTTP proxy
+  server/         connection accept, auth routing, relay
+  protocol/       PSK → UID, HMAC token, session_id assembly
+  record/         framed transport with padding and heartbeat
+  mux/            Yamux multiplexer wrapper
+  uri/            mirage:// encode / decode
+  config/         JSON config loading and field parsing
+  dashboard/      web UI and REST control API
+  sysproxy/       Windows system proxy integration
+  tlspeek/        raw ClientHello parsing
+  replayconn/     ClientHello replay for server handshake
+  certutil/       TLS cert load/generate and SPKI pin
+install.sh        VPS one-command installer
+build.bat         Windows cross-compile helper
 ```
-
-### Server deployment
-
-Requirements:
-
-- Linux VPS
-- Go 1.24+
-- one open TCP port, for example `8443`
-
-Clone and build:
-
-```bash
-git clone https://github.com/WJSGZZ/MIRAGE.git /opt/mirage-src
-cd /opt/mirage-src
-go build -o miraged ./cmd/miraged
-```
-
-Generate a sample config:
-
-```bash
-./miraged -genkey
-```
-
-Run the server:
-
-```bash
-./miraged -c /path/to/config.json
-```
-
-### One-command bootstrap
-
-You no longer need to manually stitch together `config.json`, `cert pin`, and the final `mirage://` link.
-
-Build first:
-
-```bash
-go build -o miraged ./cmd/miraged
-```
-
-Then run bootstrap:
-
-```bash
-./miraged -bootstrap -bootstrap-dir /opt/miraged -listen 0.0.0.0:443
-```
-
-That command will:
-
-- check whether the listen port is already occupied
-- auto-generate server config
-- auto-generate certificate and key
-- derive the final `cert pin`
-- auto-detect the public IP when possible
-- write:
-  - `/opt/miraged/config.json`
-  - `/opt/miraged/client.json`
-  - `/opt/miraged/mirage-cert.pem`
-  - `/opt/miraged/mirage-key.pem`
-- print the final importable `mirage://` URI
-
-Useful overrides:
-
-```bash
-./miraged -bootstrap \
-  -bootstrap-dir /opt/miraged \
-  -public-host YOUR_DOMAIN_OR_IP \
-  -listen 0.0.0.0:8443 \
-  -fallback www.microsoft.com:443 \
-  -sni www.microsoft.com \
-  -name my-vps-1 \
-  -user user1 \
-  -overwrite
-```
-
-To inspect whether a port is already occupied on Linux:
-
-```bash
-ss -ltnp | grep ':443'
-```
-
-### Windows core
-
-Build from the repository root:
-
-```powershell
-cd D:\Folder\App\MIRAGE
-go build -o miragec.exe .\cmd\miragec
-go build -o miraged.exe .\cmd\miraged
-```
-
-Run the standalone local core:
-
-```powershell
-.\miragec.exe --servers .\servers.json --no-browser
-```
-
-By default the core exposes:
-
-- control API on `127.0.0.1:9099`
-- SOCKS5 on `127.0.0.1:1080`
-- HTTP proxy on `127.0.0.1:1081`
-
-### Native Windows client
-
-The primary Windows client lives in `MirageClient.WPF/`.
-
-Build it:
-
-```powershell
-dotnet build .\MirageClient.WPF\MirageClient.WPF.csproj
-```
-
-Run it:
-
-```powershell
-.\MirageClient.WPF\bin\Debug\net8.0-windows\MirageClient.exe
-```
-
-Current desktop client behavior:
-
-- native WPF window, not a WebView shell
-- auto-starts the local `miragec` core when needed
-- tray menu for open, connect, disconnect, proxy mode switching, reapply, and exit
-- system proxy policy modes:
-  - clear system proxy
-  - auto system proxy
-  - manual mode
-  - PAC mode
-- diagnostics page with copyable full report
-
-### Proxy coverage
-
-MIRAGE currently covers:
-
-- Windows system proxy
-- PAC URL mode
-- WinHTTP
-- process environment proxy
-- manual SOCKS5 / HTTP proxy usage
-
-This covers browsers and many tools, but not everything. If a program still bypasses MIRAGE, the remaining gap is usually full traffic capture such as:
-
-- TUN
-- WFP / service mode
-- app-specific launch and capture helpers
-
-### Development notes
-
-- `MirageClient.WPF/bin` and `MirageClient.WPF/obj` are build output and should not be committed.
-- Real local profile data such as `servers.json` should not be committed.
-- Protocol migration work is tracked in [`PROTOCOL_MIGRATION_TODO.md`](PROTOCOL_MIGRATION_TODO.md).
 
 ---
 
@@ -244,234 +168,156 @@ This covers browsers and many tools, but not everything. If a program still bypa
 
 ### MIRAGE 是什么
 
-MIRAGE 是一个抗审查代理项目，目前包含：
+MIRAGE 是一个抗审查代理。它把认证信息嵌进 TLS ClientHello 的 `session_id` 字段，流量看起来和普通 HTTPS 没有区别——没有额外握手，没有可识别的特征。
 
-- `miraged`：Linux 服务端二进制
-- `miragec`：Windows 本地代理核心
-- `MirageClient.WPF`：原生 Windows 桌面客户端
+- **`miraged`** — Linux VPS 服务端
+- **`miragec`** — Windows 代理核心（无界面 CLI 或 Web 面板）
 
-当前项目路线是逐步做成更接近主流客户端的软件架构：
+---
 
-- Go 实现传输层和本地代理核心
-- 原生 Windows 桌面界面
-- UI 与核心之间使用明确的本地控制 API
-- 清晰展示系统代理、WinHTTP、PAC、环境变量这些接管层
+### VPS 部署（一条命令）
 
-### 当前状态
-
-MIRAGE 目前已经支持：
-
-- 基于 TLS 的客户端 / 服务端传输
-- 本地 SOCKS5 和 HTTP 代理监听
-- Windows 系统代理集成
-- WinHTTP 应用流程
-- 用户级环境变量代理导出
-- 面向桌面客户端的规范化控制 API
-- `/stats` 的真实流量统计
-- 原生 WPF 客户端，具备：
-  - 中英文界面
-  - 默认跟随系统语言
-  - 托盘集成
-  - 单实例行为
-  - `mirage://` 节点导入
-  - 代理模式设置
-  - 一键复制诊断报告
-  - 自动拉起本地 `miragec` 核心
-
-但它 **还没有** 达到成熟 TUN 客户端那种“几乎全局接管”的程度。  
-如果某些软件不认 WinINet、WinHTTP、PAC、环境变量代理，它仍然可能绕过 MIRAGE，直到后续补上 TUN 或服务模式。
-
-### 架构概览
-
-```text
-[Windows 桌面端]
-   MirageClient.WPF
-          |
-          v
-   本地控制 API :9099
-          |
-          v
-       miragec
- HTTP :1081 / SOCKS5 :1080
-          |
-          v
-   TLS 传输 + record 层 + Yamux
-          |
-          v
-[Linux VPS]
-       miraged
-          |
-          v
-        目标站点
+```bash
+git clone https://github.com/WJSGZZ/MIRAGE.git
+cd MIRAGE
+bash install.sh 443
 ```
+
+脚本会自动：
+
+1. 如果没有 Go 则自动安装
+2. 从源码编译 `miraged`
+3. 自动生成配置、TLS 证书、PSK 和 cert pin
+4. 自动探测公网 IP
+5. 打印最终 `mirage://` 口令
+6. 安装并启动 systemd 服务
+
+**端口选择** — 作为第一个参数传入，或不传进入交互菜单：
+
+```bash
+bash install.sh 443    # 标准 HTTPS 端口（推荐）
+bash install.sh 8443   # 备用 TLS 端口
+bash install.sh 80     # HTTP 端口，可绕过部分防火墙
+bash install.sh        # 交互菜单
+```
+
+> 需要 root 权限运行，且所选端口不能被占用。
+
+脚本结束时会显示：
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║            MIRAGE:// IMPORT TOKEN (save this!)              ║
+╠══════════════════════════════════════════════════════════════╣
+║  mirage://xxxx@1.2.3.4:443?sni=www.microsoft.com&cert_pin=...
+╚══════════════════════════════════════════════════════════════╝
+```
+
+保存这行口令，它包含服务器地址、PSK、cert pin 和 padding seed。
+
+---
+
+### Windows 客户端
+
+在仓库根目录编译（需要 Go）：
+
+```powershell
+go build -o miragec.exe .\cmd\miragec
+```
+
+**无界面模式**（推荐——不开 UI，直接跑代理）：
+
+```powershell
+# 用 mirage:// 口令
+.\miragec.exe -uri "mirage://xxxx@1.2.3.4:443?..."
+
+# 用 client.json 文件
+.\miragec.exe -c client.json
+```
+
+启动后提供：
+- SOCKS5 代理 `127.0.0.1:1080`
+- HTTP 代理 `127.0.0.1:1081`
+
+**面板模式**（Web UI，访问 `http://127.0.0.1:9099`）：
+
+```powershell
+.\miragec.exe
+```
+
+**参数说明：**
+
+| 参数 | 默认值 | 用途 |
+|------|--------|------|
+| `-c 路径` | — | 加载 client.json，无界面运行 |
+| `-uri mirage://...` | — | 直接解析口令，无界面运行 |
+| `-socks5 地址` | 配置文件中的值 | 覆盖 SOCKS5 监听地址 |
+| `-http 地址` | 配置文件中的值 | 覆盖 HTTP 监听地址 |
+| `-servers 路径` | exe 同目录的 `servers.json` | 面板模式节点文件 |
+| `-no-browser` | false | 不自动打开浏览器 |
+
+---
+
+### 配合 v2rayN 使用
+
+后台运行 `miragec.exe` 无界面模式（SOCKS5 在 `:1080`），然后在 v2rayN 中添加自定义配置：
+
+```json
+{
+  "inbounds": [
+    {"protocol": "socks", "port": 10808, "listen": "127.0.0.1",
+     "settings": {"auth": "noauth", "udp": false}}
+  ],
+  "outbounds": [
+    {"protocol": "socks",
+     "settings": {"servers": [{"address": "127.0.0.1", "port": 1080}]}}
+  ]
+}
+```
+
+v2rayN 负责路由规则，MIRAGE 负责隧道传输。
+
+---
+
+### 架构
+
+```
+[Windows]
+  miragec.exe
+  SOCKS5 :1080 / HTTP :1081
+       |
+       | TLS（uTLS Chrome 指纹）
+       | session_id = UID(4字节) + HMAC-token(28字节)
+       | record 层 + Yamux
+       v
+[Linux VPS]
+  miraged
+       |
+       v
+    目标站点
+```
+
+---
 
 ### 仓库结构
 
-```text
+```
 cmd/
-  miraged/                  服务端入口
-  miragec/                  客户端 / 本地核心入口
-MirageClient.WPF/           原生 Windows 桌面客户端
+  miraged/        服务端入口
+  miragec/        客户端入口（无界面 + 面板）
 internal/
-  client/                   MIRAGE 客户端、SOCKS5、HTTP 代理
-  server/                   MIRAGE 服务端运行时
-  daemon/                   本地客户端核心生命周期
-  dashboard/                本地控制 API 与诊断
-  sysproxy/                 Windows 代理集成
-  protocol/                 协议辅助模块
-  record/                   分帧传输层
-  tlspeek/                  ClientHello 解析
-  replayconn/               服务端握手重放连接
-  uri/                      mirage:// 链接解析
+  client/         TLS 拨号、SOCKS5、HTTP 代理
+  server/         连接接受、认证路由、中继
+  protocol/       PSK → UID、HMAC token、session_id 组装
+  record/         带 padding 和心跳的分帧传输层
+  mux/            Yamux 多路复用封装
+  uri/            mirage:// 编解码
+  config/         JSON 配置加载与字段解析
+  dashboard/      Web UI 与 REST 控制 API
+  sysproxy/       Windows 系统代理集成
+  tlspeek/        原始 ClientHello 解析
+  replayconn/     服务端握手重放连接
+  certutil/       TLS 证书加载/生成与 SPKI pin
+install.sh        VPS 一键安装脚本
+build.bat         Windows 交叉编译辅助脚本
 ```
-
-### 服务端部署
-
-要求：
-
-- Linux VPS
-- Go 1.24+
-- 一个开放的 TCP 端口，例如 `8443`
-
-克隆并编译：
-
-```bash
-git clone https://github.com/WJSGZZ/MIRAGE.git /opt/mirage-src
-cd /opt/mirage-src
-go build -o miraged ./cmd/miraged
-```
-
-生成示例配置：
-
-```bash
-./miraged -genkey
-```
-
-启动服务端：
-
-```bash
-./miraged -c /path/to/config.json
-```
-
-### 一键初始化
-
-现在不需要再手动拼 `config.json`、`cert pin` 和最终 `mirage://` 了。
-
-先编译：
-
-```bash
-go build -o miraged ./cmd/miraged
-```
-
-再执行一键初始化：
-
-```bash
-./miraged -bootstrap -bootstrap-dir /opt/miraged -listen 0.0.0.0:443
-```
-
-这个命令会自动：
-
-- 检查监听端口是否已被占用
-- 生成服务端配置
-- 生成证书和私钥
-- 计算最终 `cert pin`
-- 尽量自动探测公网 IP
-- 写出：
-  - `/opt/miraged/config.json`
-  - `/opt/miraged/client.json`
-  - `/opt/miraged/mirage-cert.pem`
-  - `/opt/miraged/mirage-key.pem`
-- 直接打印最终可导入的 `mirage://`
-
-常用覆盖参数：
-
-```bash
-./miraged -bootstrap \
-  -bootstrap-dir /opt/miraged \
-  -public-host 你的域名或公网IP \
-  -listen 0.0.0.0:8443 \
-  -fallback www.microsoft.com:443 \
-  -sni www.microsoft.com \
-  -name my-vps-1 \
-  -user user1 \
-  -overwrite
-```
-
-查看 Linux 上某个端口目前被谁占用：
-
-```bash
-ss -ltnp | grep ':443'
-```
-
-### Windows 本地核心
-
-在仓库根目录编译：
-
-```powershell
-cd D:\Folder\App\MIRAGE
-go build -o miragec.exe .\cmd\miragec
-go build -o miraged.exe .\cmd\miraged
-```
-
-手动运行本地核心：
-
-```powershell
-.\miragec.exe --servers .\servers.json --no-browser
-```
-
-默认会暴露：
-
-- 控制 API：`127.0.0.1:9099`
-- SOCKS5：`127.0.0.1:1080`
-- HTTP 代理：`127.0.0.1:1081`
-
-### 原生 Windows 客户端
-
-现在的主 Windows 客户端位于 `MirageClient.WPF/`。
-
-编译：
-
-```powershell
-dotnet build .\MirageClient.WPF\MirageClient.WPF.csproj
-```
-
-运行：
-
-```powershell
-.\MirageClient.WPF\bin\Debug\net8.0-windows\MirageClient.exe
-```
-
-当前桌面客户端特性：
-
-- 使用原生 WPF 窗口，而不是 WebView 外壳
-- 需要时自动启动本地 `miragec` 核心
-- 托盘菜单支持打开、连接、断开、切换代理模式、重新应用代理、退出
-- 系统代理策略包含：
-  - 清除系统代理
-  - 自动配置系统代理
-  - 手动模式
-  - PAC 模式
-- 诊断页支持复制完整报告
-
-### 代理接管范围
-
-当前 MIRAGE 已能覆盖：
-
-- Windows 系统代理
-- PAC 模式
-- WinHTTP
-- 进程环境变量代理
-- 手动配置 SOCKS5 / HTTP 代理的软件
-
-这已经能覆盖浏览器和不少工具，但还不是“全接管”。  
-如果某个程序仍然绕过 MIRAGE，通常缺的是更底层的流量接管能力，例如：
-
-- TUN
-- WFP / 服务模式
-- 面向特定应用的启动与接管辅助
-
-### 开发说明
-
-- `MirageClient.WPF/bin` 和 `MirageClient.WPF/obj` 属于构建产物，不应提交。
-- `servers.json` 这类本地真实节点配置不应提交到仓库。
-- 协议迁移进度见 [`PROTOCOL_MIGRATION_TODO.md`](PROTOCOL_MIGRATION_TODO.md)。
