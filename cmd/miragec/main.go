@@ -19,6 +19,7 @@ import (
 	"miraged/internal/config"
 	"miraged/internal/dashboard"
 	"miraged/internal/sysproxy"
+	tunmode "miraged/internal/tun"
 	"miraged/internal/uri"
 )
 
@@ -27,12 +28,13 @@ const dashAddr = "127.0.0.1:9099"
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	cfgPath      := flag.String("c", "", "client config file — starts headless proxy (no UI)")
-	uriStr       := flag.String("uri", "", "mirage:// URI — starts headless proxy directly")
-	socks5Addr   := flag.String("socks5", "", "override SOCKS5 listen addr (headless mode)")
-	httpAddr     := flag.String("http", "", "override HTTP proxy listen addr (headless mode)")
-	serversFile  := flag.String("servers", defaultServersFile(), "servers.json path (dashboard mode)")
-	noBrowser    := flag.Bool("no-browser", false, "do not open browser in dashboard mode")
+	cfgPath     := flag.String("c", "", "client config file — starts headless proxy (no UI)")
+	uriStr      := flag.String("uri", "", "mirage:// URI — starts headless proxy directly")
+	socks5Addr  := flag.String("socks5", "", "override SOCKS5 listen addr (headless mode)")
+	httpAddr    := flag.String("http", "", "override HTTP proxy listen addr (headless mode)")
+	tunMode     := flag.Bool("tun", false, "TUN mode: capture all traffic (requires admin + wintun.dll)")
+	serversFile := flag.String("servers", defaultServersFile(), "servers.json path (dashboard mode)")
+	noBrowser   := flag.Bool("no-browser", false, "do not open browser in dashboard mode")
 	flag.Parse()
 
 	switch {
@@ -41,14 +43,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("miragec: config: %v", err)
 		}
-		runHeadless(cfg, *socks5Addr, *httpAddr)
+		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode)
 
 	case strings.TrimSpace(*uriStr) != "":
 		cfg, err := configFromURI(*uriStr)
 		if err != nil {
 			log.Fatalf("miragec: uri: %v", err)
 		}
-		runHeadless(cfg, *socks5Addr, *httpAddr)
+		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode)
 
 	default:
 		if err := runDashboard(*serversFile, *noBrowser); err != nil {
@@ -59,7 +61,7 @@ func main() {
 
 // runHeadless starts the SOCKS5 and HTTP proxy listeners directly, no UI.
 // Blocks until SIGINT/SIGTERM.
-func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string) {
+func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, tun bool) {
 	socks5 := cfg.LocalSocks5
 	if strings.TrimSpace(socks5Override) != "" {
 		socks5 = socks5Override
@@ -99,14 +101,28 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string) 
 	}
 	fmt.Printf("  Server : %s\n\n", cfg.Server)
 
-	sysproxy.Set(httpListen, socks5)
-	fmt.Println("System proxy set. Press Ctrl+C to stop.")
+	if tun {
+		vpsHost, _, _ := net.SplitHostPort(cfg.Server)
+		if err := tunmode.Start(socks5, vpsHost); err != nil {
+			log.Fatalf("miragec: TUN: %v", err)
+		}
+		fmt.Println("TUN mode active — all traffic captured. Press Ctrl+C to stop.")
+	} else {
+		sysproxy.Set(httpListen, socks5)
+		fmt.Println("System proxy set. Press Ctrl+C to stop.")
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	log.Println("miragec: shutting down")
-	sysproxy.Clear()
+
+	if tun {
+		vpsHost, _, _ := net.SplitHostPort(cfg.Server)
+		tunmode.Stop(vpsHost)
+	} else {
+		sysproxy.Clear()
+	}
 	socks5Ln.Close()
 }
 
