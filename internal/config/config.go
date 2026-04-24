@@ -23,9 +23,9 @@ type ServerUser struct {
 	PSK     string `json:"psk,omitempty"`
 	ShortID string `json:"shortId,omitempty"`
 
-	PSKBytes      []byte
-	UID           [4]byte
-	ShortIDBytes  []byte
+	PSKBytes     []byte
+	UID          [4]byte
+	ShortIDBytes []byte
 }
 
 // ServerConfig is loaded from the server's config.json.
@@ -375,7 +375,7 @@ func parseSpecClientFields(cfg *ClientConfig) error {
 	}
 	cfg.CertPinBytes = cfg.CertPinBytes[:0]
 	for i, pin := range cfg.CertPins {
-		raw, err := protocol.ParseBase64URLNoPad(pin)
+		raw, err := parseCertPin(pin)
 		if err != nil {
 			return fmt.Errorf("cert_pin[%d]: %w", i, err)
 		}
@@ -402,6 +402,19 @@ func parseSpecClientFields(cfg *ClientConfig) error {
 	}
 	copy(cfg.ClientPaddingSeedBytes[:], seed)
 	return nil
+}
+
+func parseCertPin(pin string) ([]byte, error) {
+	pin = strings.TrimSpace(pin)
+	raw, err := protocol.ParseBase64URLNoPad(pin)
+	if err == nil {
+		return raw, nil
+	}
+	std, stdErr := base64.StdEncoding.DecodeString(pin)
+	if stdErr == nil {
+		return std, nil
+	}
+	return nil, err
 }
 
 func nextPortAddrOrEmpty(addr string) string {

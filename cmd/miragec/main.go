@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/base64"
 	"flag"
 	"fmt"
@@ -8,10 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 
@@ -28,13 +27,20 @@ const dashAddr = "127.0.0.1:9099"
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	cfgPath     := flag.String("c", "", "client config file — starts headless proxy (no UI)")
-	uriStr      := flag.String("uri", "", "mirage:// URI — starts headless proxy directly")
-	socks5Addr  := flag.String("socks5", "", "override SOCKS5 listen addr (headless mode)")
-	httpAddr    := flag.String("http", "", "override HTTP proxy listen addr (headless mode)")
-	tunMode     := flag.Bool("tun", false, "TUN mode: capture all traffic (requires admin + wintun.dll)")
-	serversFile := flag.String("servers", defaultServersFile(), "servers.json path (dashboard mode)")
-	noBrowser   := flag.Bool("no-browser", false, "do not open browser in dashboard mode")
+	cfgPath := flag.String("c", "", "client config file; starts headless proxy without API")
+	uriStr := flag.String("uri", "", "mirage:// URI; starts headless proxy directly")
+	socks5Addr := flag.String("socks5", "", "override SOCKS5 listen addr (headless mode)")
+	httpAddr := flag.String("http", "", "override HTTP proxy listen addr (headless mode)")
+	tunMode := flag.Bool("tun", false, "TUN mode for headless proxy (requires admin + wintun.dll)")
+	setSystemProxy := flag.Bool("set-system-proxy", false, "headless mode: also write Windows system proxy settings")
+
+	coreMode := flag.Bool("core", false, "run local MIRAGE control API")
+	dashListen := flag.String("dashboard", dashAddr, "control API listen address")
+	serversFile := flag.String("servers", defaultServersFile(), "servers.json path (API mode)")
+	importURI := flag.String("import-uri", "", "import mirage:// URI into servers.json before serving API")
+	connectID := flag.String("connect-id", "", "auto-connect profile ID after startup")
+	connectLast := flag.Bool("connect-last", false, "auto-connect the last profile in servers.json after startup")
+
 	flag.Parse()
 
 	switch {
@@ -43,25 +49,55 @@ func main() {
 		if err != nil {
 			log.Fatalf("miragec: config: %v", err)
 		}
-		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode)
+		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode, *setSystemProxy)
 
 	case strings.TrimSpace(*uriStr) != "":
 		cfg, err := configFromURI(*uriStr)
 		if err != nil {
 			log.Fatalf("miragec: uri: %v", err)
 		}
-		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode)
+		runHeadless(cfg, *socks5Addr, *httpAddr, *tunMode, *setSystemProxy)
 
 	default:
-		if err := runDashboard(*serversFile, *noBrowser); err != nil {
+		if flag.NFlag() == 0 {
+			if err := runInteractive(defaultServersFile(), dashAddr); err != nil {
+				log.Fatalf("miragec: %v", err)
+			}
+			return
+		}
+		if err := runCore(*serversFile, *dashListen, *coreMode, *importURI, *connectID, *connectLast); err != nil {
 			log.Fatalf("miragec: %v", err)
 		}
 	}
 }
 
-// runHeadless starts the SOCKS5 and HTTP proxy listeners directly, no UI.
-// Blocks until SIGINT/SIGTERM.
-func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, tun bool) {
+func runInteractive(serversFile, addr string) error {
+	fmt.Println("MIRAGE Clash bridge")
+	fmt.Println("Paste a mirage:// link and press Enter.")
+	fmt.Println("MIRAGE will start a local subscription for Clash Verge.")
+	fmt.Println()
+	fmt.Print("mirage:// > ")
+
+	reader := bufio.NewReader(os.Stdin)
+	rawURI, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read URI: %w", err)
+	}
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return fmt.Errorf("empty mirage:// link")
+	}
+	if !strings.HasPrefix(strings.ToLower(rawURI), "mirage://") {
+		return fmt.Errorf("expected a mirage:// link")
+	}
+
+	fmt.Println()
+	fmt.Println("Starting MIRAGE core in bridge mode...")
+	return runCore(serversFile, addr, true, rawURI, "", true)
+}
+
+// runHeadless starts SOCKS5 and HTTP listeners directly without the API service.
+func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, tun, setSystemProxy bool) {
 	socks5 := cfg.LocalSocks5
 	if strings.TrimSpace(socks5Override) != "" {
 		socks5 = socks5Override
@@ -73,6 +109,9 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, 
 	httpListen := cfg.LocalHTTP
 	if strings.TrimSpace(httpOverride) != "" {
 		httpListen = httpOverride
+	}
+	if strings.TrimSpace(httpListen) == "" {
+		httpListen = "127.0.0.1:1081"
 	}
 
 	c := client.New(cfg)
@@ -89,7 +128,7 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, 
 		if err != nil {
 			log.Printf("miragec: http proxy listen %s: %v (skipping)", httpListen, err)
 		} else {
-			log.Printf("miragec: HTTP  proxy on %s", httpListen)
+			log.Printf("miragec: HTTP proxy on %s", httpListen)
 			go client.ServeHTTPProxy(httpLn, c, nil)
 		}
 	}
@@ -106,10 +145,12 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, 
 		if err := tunmode.Start(socks5, vpsHost); err != nil {
 			log.Fatalf("miragec: TUN: %v", err)
 		}
-		fmt.Println("TUN mode active — all traffic captured. Press Ctrl+C to stop.")
-	} else {
+		fmt.Println("TUN mode active; all traffic captured. Press Ctrl+C to stop.")
+	} else if setSystemProxy {
 		sysproxy.Set(httpListen, socks5)
 		fmt.Println("System proxy set. Press Ctrl+C to stop.")
+	} else {
+		fmt.Println("Bridge mode active; system proxy was not changed. Press Ctrl+C to stop.")
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -120,20 +161,21 @@ func runHeadless(cfg *config.ClientConfig, socks5Override, httpOverride string, 
 	if tun {
 		vpsHost, _, _ := net.SplitHostPort(cfg.Server)
 		tunmode.Stop(vpsHost)
-	} else {
+	} else if setSystemProxy {
 		sysproxy.Clear()
 	}
-	socks5Ln.Close()
+	_ = socks5Ln.Close()
 }
 
-// configFromURI parses a mirage:// URI into a ClientConfig ready for use.
+// configFromURI parses a mirage:// URI into a ClientConfig.
 func configFromURI(raw string) (*config.ClientConfig, error) {
 	s, err := uri.Decode(raw)
 	if err != nil {
 		return nil, err
 	}
-	// uri.Decode returns CertPinBase64 as standard base64, but parseSpecClientFields
-	// calls ParseBase64URLNoPad which expects base64url no-pad — convert here.
+
+	// uri.Decode returns cert pin in standard base64.
+	// ParseClientFields accepts base64url without padding, so convert here.
 	certPin := ""
 	if strings.TrimSpace(s.CertPinBase64) != "" {
 		pinBytes, err := base64.StdEncoding.DecodeString(s.CertPinBase64)
@@ -142,6 +184,7 @@ func configFromURI(raw string) (*config.ClientConfig, error) {
 		}
 		certPin = base64.RawURLEncoding.EncodeToString(pinBytes)
 	}
+
 	cfg := &config.ClientConfig{
 		Name:              s.Name,
 		Server:            s.Addr,
@@ -153,8 +196,8 @@ func configFromURI(raw string) (*config.ClientConfig, error) {
 		ProxyMode:         "manual",
 	}
 	if strings.TrimSpace(s.PubKeyBase64) != "" {
-		cfg.ServerPubKey       = s.PubKeyBase64
-		cfg.ShortID            = s.ShortID
+		cfg.ServerPubKey = s.PubKeyBase64
+		cfg.ShortID = s.ShortID
 		cfg.InsecureSkipVerify = s.InsecureSkipVerify
 	}
 	if err := config.ParseClientFields(cfg); err != nil {
@@ -163,24 +206,66 @@ func configFromURI(raw string) (*config.ClientConfig, error) {
 	return cfg, nil
 }
 
-// runDashboard starts the embedded web UI at dashAddr.
-func runDashboard(serversFile string, noBrowser bool) error {
+func runCore(serversFile, addr string, coreMode bool, importURI, connectID string, connectLast bool) error {
 	dash := dashboard.New(serversFile)
-	dash.SetProbeAddr(dashAddr)
-	ln, err := net.Listen("tcp", dashAddr)
+	dash.SetBridgeMode()
+	if strings.TrimSpace(addr) == "" {
+		addr = dashAddr
+	}
+	dash.SetProbeAddr(addr)
+
+	if strings.TrimSpace(importURI) != "" {
+		saved, err := dash.ImportURI(importURI, "")
+		if err != nil {
+			return fmt.Errorf("import-uri failed: %w", err)
+		}
+		log.Printf("miragec: imported profile %s (%s)", saved.ID, saved.Name)
+		if strings.TrimSpace(connectID) == "" {
+			connectID = saved.ID
+		}
+	}
+	if connectLast && strings.TrimSpace(connectID) == "" {
+		list := dash.Servers()
+		if len(list) > 0 {
+			connectID = list[len(list)-1].ID
+		}
+	}
+	if strings.TrimSpace(connectID) != "" {
+		if _, err := dash.Connect(connectID); err != nil {
+			return fmt.Errorf("auto connect failed: %w", err)
+		}
+		log.Printf("miragec: auto connected profile %s", connectID)
+	}
+
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("dashboard listen %s: %w", dashAddr, err)
+		return fmt.Errorf("dashboard listen %s: %w", addr, err)
 	}
-
-	dashURL := "http://" + dashAddr
-	log.Printf("miragec: dashboard at %s", dashURL)
-	fmt.Printf("\nMIRAGE client dashboard: %s\n\n", dashURL)
-
-	if !noBrowser {
-		go openBrowser(dashURL)
+	if coreMode {
+		log.Printf("miragec: core API at http://%s", addr)
+	} else {
+		log.Printf("miragec: control API at http://%s", addr)
 	}
-
+	printClashInstructions(addr, dash.State())
 	return http.Serve(ln, dash.Handler())
+}
+
+func printClashInstructions(addr string, state dashboard.State) {
+	if strings.TrimSpace(addr) == "" {
+		addr = dashAddr
+	}
+	url := "http://" + addr + "/compat/mihomo.yaml"
+	fmt.Println()
+	fmt.Println("MIRAGE bridge is ready.")
+	if state.Running {
+		fmt.Printf("Local SOCKS : %s\n", state.Socks5)
+		fmt.Printf("Local HTTP  : %s\n", state.HTTP)
+	}
+	fmt.Println("Clash URL   : " + url)
+	fmt.Println()
+	fmt.Println("Import that URL in Clash Verge Rev, then enable Clash System Proxy or TUN.")
+	fmt.Println("MIRAGE will not change Windows proxy, WinHTTP, or proxy environment variables.")
+	fmt.Println("Press Ctrl+C to stop MIRAGE core.")
 }
 
 func defaultServersFile() string {
@@ -189,17 +274,4 @@ func defaultServersFile() string {
 		return "servers.json"
 	}
 	return filepath.Join(filepath.Dir(exe), "servers.json")
-}
-
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		cmd = exec.Command("open", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	_ = cmd.Start()
 }

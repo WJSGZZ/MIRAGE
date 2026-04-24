@@ -1,15 +1,14 @@
-// Package dashboard serves the local web UI and REST API for miragec.
+// Package dashboard serves the local control API for miragec.
 package dashboard
 
 import (
 	"bufio"
 	"crypto/rand"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -26,9 +25,6 @@ import (
 	"miraged/internal/sysproxy"
 	"miraged/internal/uri"
 )
-
-//go:embed index.html
-var static embed.FS
 
 // SavedServer is one entry in servers.json.
 type SavedServer struct {
@@ -59,18 +55,20 @@ const (
 
 // Dashboard owns the HTTP mux, daemon, and persisted server list.
 type Dashboard struct {
-	mu        sync.Mutex
-	d         *daemon.Daemon
-	servers   []SavedServer
-	activeID  string
-	file      string // path to servers.json
-	proxyFile string
-	proxyCfg  proxyConfig
-	probeAddr string
-	startedAt time.Time
-	logs      *memoryLog
+	mu                  sync.Mutex
+	d                   *daemon.Daemon
+	servers             []SavedServer
+	activeID            string
+	file                string // path to servers.json
+	proxyFile           string
+	proxyCfg            proxyConfig
+	probeAddr           string
+	startedAt           time.Time
+	logs                *memoryLog
 	lastProxyApplyAt    string
 	lastProxyApplyError string
+	tunActive           bool
+	tunTarget           string
 }
 
 // New loads servers.json from file (creating it if absent) and returns a Dashboard.
@@ -94,10 +92,10 @@ func (dash *Dashboard) SetProbeAddr(addr string) {
 	dash.mu.Unlock()
 }
 
-// Handler returns the HTTP handler for the dashboard.
+// Handler returns the HTTP handler for the control API.
 func (dash *Dashboard) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", dash.serveIndex)
+	mux.HandleFunc("/", dash.serveRoot)
 	mux.HandleFunc("/health", dash.apiHealth)
 	mux.HandleFunc("/version", dash.apiVersion)
 	mux.HandleFunc("/state", dash.apiState)
@@ -111,6 +109,8 @@ func (dash *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("/proxy/reapply", dash.apiProxyReapply)
 	mux.HandleFunc("/proxy/pac", dash.apiProxyPAC)
 	mux.HandleFunc("/pac.js", dash.servePAC)
+	mux.HandleFunc("/compat/mihomo.yaml", dash.serveMihomoCompat)
+	mux.HandleFunc("/compat/v2rayn.json", dash.serveV2RayNCompat)
 	mux.HandleFunc("/api/state", dash.apiState)
 	mux.HandleFunc("/api/servers", dash.apiServers)
 	mux.HandleFunc("/api/import", dash.apiImport)
@@ -137,29 +137,44 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func (dash *Dashboard) serveIndex(w http.ResponseWriter, r *http.Request) {
-	data, _ := static.ReadFile("index.html")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(data)
+func (dash *Dashboard) serveRoot(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, map[string]interface{}{
+		"ok":       true,
+		"service":  "miragec-core",
+		"version":  coreVersion,
+		"protocol": protocolVersion,
+		"endpoints": []string{
+			"/health",
+			"/state",
+			"/profiles",
+			"/api/import",
+			"/api/connect",
+			"/api/disconnect",
+			"/compat/mihomo.yaml",
+			"/compat/v2rayn.json",
+		},
+	})
 }
 
 type stateResp struct {
-	Running    bool   `json:"running"`
-	Status     string `json:"status"`
-	Socks5     string `json:"socks5"`     // empty when not running
-	HTTP       string `json:"http"`       // empty when not running
-	EnvHTTP    string `json:"envHttp"`    // recommended HTTP(S)_PROXY value
-	EnvALL     string `json:"envAll"`     // recommended ALL_PROXY value
-	EnvNote    string `json:"envNote"`    // note for apps that read env at startup
-	ProxyScope string `json:"proxyScope"` // summary of what was applied on connect
-	CaptureGap string `json:"captureGap"` // why some apps can still bypass the proxy
-	ActiveID   string `json:"activeId"`   // empty when not running
-	ProxyMode  string `json:"proxyMode"`
-	ProxyApplied bool `json:"proxyApplied"`
-	ApplyWinHTTP bool `json:"applyWinHttp"`
-	ExportEnv bool `json:"exportEnv"`
-	PACURL string `json:"pacUrl"`
-	LastProxyApplyAt string `json:"lastProxyApplyAt"`
+	Running             bool   `json:"running"`
+	Status              string `json:"status"`
+	Socks5              string `json:"socks5"`     // empty when not running
+	HTTP                string `json:"http"`       // empty when not running
+	EnvHTTP             string `json:"envHttp"`    // recommended HTTP(S)_PROXY value
+	EnvALL              string `json:"envAll"`     // recommended ALL_PROXY value
+	EnvNote             string `json:"envNote"`    // note for apps that read env at startup
+	ProxyScope          string `json:"proxyScope"` // summary of what was applied on connect
+	CaptureGap          string `json:"captureGap"` // why some apps can still bypass the proxy
+	ActiveID            string `json:"activeId"`   // empty when not running
+	ProxyMode           string `json:"proxyMode"`
+	ProxyApplied        bool   `json:"proxyApplied"`
+	ApplyWinHTTP        bool   `json:"applyWinHttp"`
+	ExportEnv           bool   `json:"exportEnv"`
+	PACURL              string `json:"pacUrl"`
+	TUNActive           bool   `json:"tunActive"`
+	TUNTarget           string `json:"tunTarget"`
+	LastProxyApplyAt    string `json:"lastProxyApplyAt"`
 	LastProxyApplyError string `json:"lastProxyApplyError"`
 }
 
@@ -169,15 +184,15 @@ type versionResp struct {
 }
 
 type statsResp struct {
-	Running          bool   `json:"running"`
-	ActiveProfile    string `json:"activeProfile"`
-	UptimeSeconds    int64  `json:"uptimeSeconds"`
-	Socks5Listen     string `json:"socks5Listen"`
-	HTTPListen       string `json:"httpListen"`
-	UploadBytes      int64  `json:"uploadBytes"`
-	DownloadBytes    int64  `json:"downloadBytes"`
-	UploadRateBps    int64  `json:"uploadRateBps"`
-	DownloadRateBps  int64  `json:"downloadRateBps"`
+	Running         bool   `json:"running"`
+	ActiveProfile   string `json:"activeProfile"`
+	UptimeSeconds   int64  `json:"uptimeSeconds"`
+	Socks5Listen    string `json:"socks5Listen"`
+	HTTPListen      string `json:"httpListen"`
+	UploadBytes     int64  `json:"uploadBytes"`
+	DownloadBytes   int64  `json:"downloadBytes"`
+	UploadRateBps   int64  `json:"uploadRateBps"`
+	DownloadRateBps int64  `json:"downloadRateBps"`
 }
 
 type profileResp struct {
@@ -265,40 +280,11 @@ func (dash *Dashboard) apiImport(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	srv, err := uri.Decode(req.URI)
+	saved, err := dash.ImportURI(req.URI, req.Listen)
 	if err != nil {
 		jsonErr(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	listen := req.Listen
-	if listen == "" {
-		listen = "127.0.0.1:1080"
-	}
-
-	id, _ := randomHex(4)
-	saved := SavedServer{
-		ID:                 id,
-		Name:               srv.Name,
-		UserName:           srv.UserName,
-		Addr:               srv.Addr,
-		PSK:                srv.PSKBase64,
-		CertPin:            srv.CertPinBase64,
-		ClientPaddingSeed:  srv.PaddingSeedBase64,
-		PubKeyBase64:       srv.PubKeyBase64,
-		SNI:                srv.SNI,
-		ShortID:            srv.ShortID,
-		InsecureSkipVerify: srv.InsecureSkipVerify,
-		Listen:             listen,
-	}
-	if saved.Name == "" {
-		saved.Name = srv.Addr
-	}
-
-	dash.mu.Lock()
-	dash.servers = append(dash.servers, saved)
-	dash.save()
-	dash.mu.Unlock()
-
 	jsonOK(w, saved)
 }
 
@@ -330,6 +316,15 @@ func (dash *Dashboard) ImportURI(rawURI, listen string) (SavedServer, error) {
 	}
 
 	dash.mu.Lock()
+	for i := range dash.servers {
+		if dash.servers[i].Addr == saved.Addr && dash.servers[i].UserName == saved.UserName {
+			saved.ID = dash.servers[i].ID
+			dash.servers[i] = saved
+			dash.save()
+			dash.mu.Unlock()
+			return saved, nil
+		}
+	}
 	dash.servers = append(dash.servers, saved)
 	dash.save()
 	dash.mu.Unlock()
@@ -840,26 +835,30 @@ func (dash *Dashboard) currentState() stateResp {
 	proxyCfg := dash.proxyCfg
 	lastAt := dash.lastProxyApplyAt
 	lastErr := dash.lastProxyApplyError
+	tunActive := dash.tunActive
+	tunTarget := dash.tunTarget
 	dash.mu.Unlock()
 	system := sysproxy.SnapshotState()
 
 	resp := stateResp{
-		Running:    dash.d.Running(),
-		Status:     "idle",
-		Socks5:     dash.d.SocksListen(),
-		HTTP:       dash.d.HTTPListen(),
-		EnvHTTP:    "http://" + dash.d.HTTPListen(),
-		EnvALL:     "socks5://" + dash.d.SocksListen(),
-		EnvNote:    "Apps already open may need a restart to pick up proxy environment variables.",
-		ProxyScope: "MIRAGE applies Windows system proxy settings and user proxy environment variables, then checks whether WinHTTP also picked them up.",
-		CaptureGap: "Apps that ignore WinINet, WinHTTP, and proxy environment variables can still bypass MIRAGE until TUN or service mode is added.",
-		ActiveID:   activeID,
-		ProxyMode:  proxyCfg.Mode,
-		ProxyApplied: proxyModeApplied(proxyCfg.Mode, system),
-		ApplyWinHTTP: proxyCfg.ApplyWinHTTP,
-		ExportEnv: proxyCfg.ExportEnv,
-		PACURL: dash.proxyPACURL(),
-		LastProxyApplyAt: lastAt,
+		Running:             dash.d.Running(),
+		Status:              "idle",
+		Socks5:              dash.d.SocksListen(),
+		HTTP:                dash.d.HTTPListen(),
+		EnvHTTP:             "http://" + dash.d.HTTPListen(),
+		EnvALL:              "socks5://" + dash.d.SocksListen(),
+		EnvNote:             "Apps already open may need a restart to pick up proxy environment variables.",
+		ProxyScope:          "MIRAGE applies Windows system proxy settings and user proxy environment variables, then checks whether WinHTTP also picked them up.",
+		CaptureGap:          "Apps that ignore WinINet, WinHTTP, and proxy environment variables can still bypass MIRAGE until TUN or service mode is added.",
+		ActiveID:            activeID,
+		ProxyMode:           proxyCfg.Mode,
+		ProxyApplied:        proxyModeApplied(proxyCfg.Mode, system),
+		ApplyWinHTTP:        proxyCfg.ApplyWinHTTP,
+		ExportEnv:           proxyCfg.ExportEnv,
+		PACURL:              dash.proxyPACURL(),
+		TUNActive:           tunActive,
+		TUNTarget:           tunTarget,
+		LastProxyApplyAt:    lastAt,
 		LastProxyApplyError: lastErr,
 	}
 	if resp.Running {
@@ -881,10 +880,10 @@ type logEntry struct {
 }
 
 type memoryLog struct {
-	mu      sync.Mutex
-	lines   []logEntry
-	max     int
-	target  io.Writer
+	mu     sync.Mutex
+	lines  []logEntry
+	max    int
+	target io.Writer
 }
 
 var installLogOnce sync.Once

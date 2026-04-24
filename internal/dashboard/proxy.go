@@ -3,12 +3,14 @@ package dashboard
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"miraged/internal/sysproxy"
+	tunmode "miraged/internal/tun"
 )
 
 const (
@@ -16,6 +18,7 @@ const (
 	proxyModeSystem = "system"
 	proxyModeManual = "manual"
 	proxyModePAC    = "pac"
+	proxyModeTUN    = "tun"
 )
 
 type proxyConfig struct {
@@ -33,22 +36,24 @@ type proxyConfigResp struct {
 	Applied        bool              `json:"applied"`
 	LastApplyAt    string            `json:"lastApplyAt"`
 	LastApplyError string            `json:"lastApplyError"`
+	TunActive      bool              `json:"tunActive"`
+	TunTarget      string            `json:"tunTarget"`
 	System         sysproxy.Snapshot `json:"system"`
 }
 
 func defaultProxyConfig() proxyConfig {
 	return proxyConfig{
-		Mode:         proxyModeSystem,
-		ApplyWinHTTP: true,
-		ExportEnv:    true,
+		Mode:         proxyModeManual,
+		ApplyWinHTTP: false,
+		ExportEnv:    false,
 	}
 }
 
 func normalizeProxyConfig(cfg proxyConfig) proxyConfig {
 	switch cfg.Mode {
-	case proxyModeOff, proxyModeSystem, proxyModeManual, proxyModePAC:
+	case proxyModeOff, proxyModeSystem, proxyModeManual, proxyModePAC, proxyModeTUN:
 	default:
-		cfg.Mode = proxyModeSystem
+		cfg.Mode = proxyModeManual
 	}
 	return cfg
 }
@@ -64,6 +69,18 @@ func (dash *Dashboard) loadProxyConfig() {
 		return
 	}
 	dash.proxyCfg = normalizeProxyConfig(cfg)
+}
+
+func (dash *Dashboard) SetBridgeMode() {
+	dash.mu.Lock()
+	dash.proxyCfg = proxyConfig{
+		Mode:         proxyModeManual,
+		ApplyWinHTTP: false,
+		ExportEnv:    false,
+	}
+	dash.saveProxyConfig()
+	dash.mu.Unlock()
+	dash.recordProxyApply(nil)
 }
 
 func (dash *Dashboard) saveProxyConfig() {
@@ -89,6 +106,8 @@ func (dash *Dashboard) currentProxyConfig() proxyConfigResp {
 	cfg := dash.proxyCfg
 	lastAt := dash.lastProxyApplyAt
 	lastErr := dash.lastProxyApplyError
+	tunActive := dash.tunActive
+	tunTarget := dash.tunTarget
 	dash.mu.Unlock()
 	system := sysproxy.SnapshotState()
 	return proxyConfigResp{
@@ -100,6 +119,8 @@ func (dash *Dashboard) currentProxyConfig() proxyConfigResp {
 		Applied:        proxyModeApplied(cfg.Mode, system),
 		LastApplyAt:    lastAt,
 		LastApplyError: lastErr,
+		TunActive:      tunActive,
+		TunTarget:      tunTarget,
 		System:         system,
 	}
 }
@@ -114,6 +135,8 @@ func proxyModeApplied(mode string, snapshot sysproxy.Snapshot) bool {
 		return true
 	case proxyModePAC:
 		return snapshot.AutoConfigURL != ""
+	case proxyModeTUN:
+		return true
 	default:
 		return false
 	}
@@ -125,6 +148,7 @@ func (dash *Dashboard) applyProxyPolicy() error {
 	dash.mu.Unlock()
 
 	if !dash.d.Running() {
+		dash.stopTUNIfActive()
 		if cfg.Mode == proxyModeOff {
 			err := sysproxy.ClearAll(sysproxy.ApplyOptions{ApplyWinHTTP: true, ExportEnv: true})
 			dash.recordProxyApply(err)
@@ -137,20 +161,30 @@ func (dash *Dashboard) applyProxyPolicy() error {
 	httpAddr := dash.d.HTTPListen()
 	socksAddr := dash.d.SocksListen()
 	opts := sysproxy.ApplyOptions{
-		ApplyWinHTTP: cfg.ApplyWinHTTP,
-		ExportEnv:    cfg.ExportEnv,
-		HTTPProxyAddr: httpAddr,
+		ApplyWinHTTP:   cfg.ApplyWinHTTP,
+		ExportEnv:      cfg.ExportEnv,
+		HTTPProxyAddr:  httpAddr,
 		SocksProxyAddr: socksAddr,
 	}
 
 	var err error
 	switch cfg.Mode {
-	case proxyModeOff, proxyModeManual:
+	case proxyModeManual:
+		dash.stopTUNIfActive()
+	case proxyModeOff:
+		dash.stopTUNIfActive()
 		err = sysproxy.ClearAll(sysproxy.ApplyOptions{ApplyWinHTTP: true, ExportEnv: true})
 	case proxyModeSystem:
+		dash.stopTUNIfActive()
 		err = sysproxy.ApplySystem(httpAddr, socksAddr, opts)
 	case proxyModePAC:
+		dash.stopTUNIfActive()
 		err = sysproxy.ApplyPAC(dash.proxyPACURL(), opts)
+	case proxyModeTUN:
+		err = dash.startTUNForActiveProfile(socksAddr)
+		if err == nil {
+			err = sysproxy.ClearAll(sysproxy.ApplyOptions{ApplyWinHTTP: true, ExportEnv: true})
+		}
 	default:
 		err = fmt.Errorf("unsupported proxy mode: %s", cfg.Mode)
 	}
@@ -166,9 +200,100 @@ func (dash *Dashboard) clearProxyAfterDisconnect() error {
 		dash.recordProxyApply(nil)
 		return nil
 	}
+	dash.stopTUNIfActive()
 	err := sysproxy.ClearAll(sysproxy.ApplyOptions{ApplyWinHTTP: true, ExportEnv: true})
 	dash.recordProxyApply(err)
 	return err
+}
+
+func (dash *Dashboard) startTUNForActiveProfile(socksAddr string) error {
+	if strings.TrimSpace(socksAddr) == "" {
+		return fmt.Errorf("tun: socks proxy is not running")
+	}
+
+	dash.mu.Lock()
+	activeID := dash.activeID
+	var serverAddr string
+	for _, srv := range dash.servers {
+		if srv.ID == activeID {
+			serverAddr = srv.Addr
+			break
+		}
+	}
+	if dash.tunActive && dash.tunTarget == serverAddr {
+		dash.mu.Unlock()
+		return nil
+	}
+	oldTarget := dash.tunTarget
+	wasActive := dash.tunActive
+	dash.tunActive = false
+	dash.tunTarget = ""
+	dash.mu.Unlock()
+
+	if wasActive && strings.TrimSpace(oldTarget) != "" {
+		if host, _, err := net.SplitHostPort(oldTarget); err == nil {
+			if vpsIP, err := resolveIPv4(host); err == nil {
+				tunmode.Stop(vpsIP)
+			}
+		}
+	}
+	if strings.TrimSpace(serverAddr) == "" {
+		return fmt.Errorf("tun: active profile not found")
+	}
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return fmt.Errorf("tun: server address %q: %w", serverAddr, err)
+	}
+	vpsIP, err := resolveIPv4(host)
+	if err != nil {
+		return err
+	}
+	if err := tunmode.Start(socksAddr, vpsIP); err != nil {
+		return err
+	}
+
+	dash.mu.Lock()
+	dash.tunActive = true
+	dash.tunTarget = serverAddr
+	dash.mu.Unlock()
+	return nil
+}
+
+func (dash *Dashboard) stopTUNIfActive() {
+	dash.mu.Lock()
+	active := dash.tunActive
+	target := dash.tunTarget
+	dash.tunActive = false
+	dash.tunTarget = ""
+	dash.mu.Unlock()
+
+	if !active || strings.TrimSpace(target) == "" {
+		return
+	}
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		if vpsIP, err := resolveIPv4(host); err == nil {
+			tunmode.Stop(vpsIP)
+		}
+	}
+}
+
+func resolveIPv4(host string) (string, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), nil
+		}
+		return "", fmt.Errorf("tun: IPv6 server addresses are not supported yet: %s", host)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("tun: resolve server %s: %w", host, err)
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("tun: no IPv4 address found for %s", host)
 }
 
 func (dash *Dashboard) recordProxyApply(err error) {

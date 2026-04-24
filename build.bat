@@ -6,11 +6,11 @@ echo [*] Downloading dependencies...
 go mod tidy
 
 echo.
-echo [*] Building miragec.exe (Windows client)...
+echo [*] Building miragec.exe (Windows client core)...
 set GOOS=windows
 set GOARCH=amd64
 set CGO_ENABLED=0
-go build -trimpath -ldflags="-s -w -H=windowsgui" -o miragec.exe ./cmd/miragec
+go build -trimpath -ldflags="-s -w" -o miragec.exe ./cmd/miragec
 if %ERRORLEVEL% NEQ 0 goto fail
 
 echo [*] Building miraged (Linux server)...
@@ -21,8 +21,8 @@ if %ERRORLEVEL% NEQ 0 goto fail
 
 echo.
 echo [+] Done.
-echo     miragec.exe  — run on this Windows machine
-echo     miraged      — scp to VPS, then: bash install.sh
+echo     miragec.exe  - MIRAGE core/sidecar for Clash bridge or headless mode
+echo     miraged      - deploy to VPS, or run bash install.sh on VPS
 goto end
 
 :fail

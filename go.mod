@@ -19,9 +19,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
-	github.com/xjasonlyu/tun2socks/v2 v2.6.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/crypto v0.38.0 // indirect
@@ -30,12 +28,12 @@ require (
 	golang.org/x/time v0.11.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20250523182742-eede7a881b20 // indirect
 )
 
 require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/refraction-networking/utls v1.8.2
+	github.com/xjasonlyu/tun2socks/v2 v2.6.0
 	golang.org/x/text v0.25.0
 )

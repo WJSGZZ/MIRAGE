@@ -1,323 +1,180 @@
 # MIRAGE
 
-[English](#english) | [中文](#中文)
+MIRAGE is a custom TLS-disguised proxy protocol with a small local bridge for Clash Verge Rev / mihomo.
 
----
+The recommended client workflow is intentionally simple:
 
-## English
+```text
+Apps -> Clash Verge Rev system proxy / TUN / rules -> MIRAGE local SOCKS -> MIRAGE VPS
+```
 
-### What MIRAGE is
+MIRAGE no longer tries to be a full desktop proxy client. Clash Verge Rev provides the mature UI, rules, system proxy, TUN, logs, and traffic capture. MIRAGE only provides the custom protocol core and a local Clash-compatible subscription.
 
-MIRAGE is a censorship-resistant proxy. It disguises traffic as ordinary TLS by embedding auth material inside the ClientHello `session_id` field — no extra round-trips, no distinguishable handshake.
+## Components
 
-- **`miraged`** — Linux VPS server
-- **`miragec`** — Windows proxy core (headless CLI or dashboard)
+- `miraged`: Linux VPS server.
+- `miragec`: Windows local bridge/core.
+- Clash Verge Rev / mihomo: desktop client, system proxy, TUN, rules, and UI.
 
----
+## Safety Defaults
 
-### VPS deployment (one command)
+In the recommended Clash bridge flow, `miragec` does not modify Windows proxy state:
+
+- It does not set Windows System Proxy.
+- It does not set WinHTTP proxy.
+- It does not write user `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` environment variables.
+- It only listens on local loopback ports and serves a local subscription.
+
+Traffic capture is handled by Clash Verge Rev. This keeps MIRAGE small and avoids unexpected changes to your existing v2rayN, Clash, or Windows proxy configuration.
+
+## VPS Install
+
+Run as root on the VPS:
 
 ```bash
 git clone https://github.com/WJSGZZ/MIRAGE.git
 cd MIRAGE
-bash install.sh 443
+bash install.sh 8443
 ```
 
-The script will:
+The installer will:
 
-1. Install Go if needed
-2. Build `miraged` from source
-3. Auto-generate config, TLS certificate, PSK, and cert pin
-4. Auto-detect the public IP
-5. Print the final `mirage://` import token
-6. Install and start a systemd service
+- install Go if needed,
+- build `miraged`,
+- generate cert/key/config material,
+- install and start a `miraged` systemd service,
+- print a final `mirage://` import URI.
 
-**Port options** — pass as first argument or use the interactive menu:
+Useful variants:
 
 ```bash
-bash install.sh 443    # standard HTTPS port (recommended)
-bash install.sh 8443   # alternative TLS port
-bash install.sh 80     # HTTP port, bypasses some firewalls
-bash install.sh        # interactive menu
+bash install.sh 443
+PUBLIC_HOST=1.2.3.4 bash install.sh 8443
+FALLBACK_ADDR=www.microsoft.com:443 SNI_NAME=www.microsoft.com bash install.sh 8443
 ```
 
-> Run as root. Make sure the chosen port is not already occupied.
+Check server status:
 
-At the end you will see:
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║            MIRAGE:// IMPORT TOKEN (save this!)              ║
-╠══════════════════════════════════════════════════════════════╣
-║  mirage://xxxx@1.2.3.4:443?sni=www.microsoft.com&cert_pin=...
-╚══════════════════════════════════════════════════════════════╝
+```bash
+systemctl status miraged --no-pager -l
+journalctl -u miraged -f -l
 ```
 
-Save that token — it encodes the server address, PSK, cert pin, and padding seed.
+If you regenerate server config, use the new `mirage://` URI. Old URIs can fail with `uid not found`, `SPKI pin mismatch`, or TLS EOF errors.
 
----
+## Windows + Clash Verge Rev
 
-### Windows client
-
-Build from the repository root (requires Go):
+Build `miragec.exe`:
 
 ```powershell
+cd D:\Folder\App\MIRAGE
 go build -o miragec.exe .\cmd\miragec
 ```
 
-**Headless mode** (recommended — no UI, just the proxy):
-
-```powershell
-# from a mirage:// token
-.\miragec.exe -uri "mirage://xxxx@1.2.3.4:443?..."
-
-# from a client.json file
-.\miragec.exe -c client.json
-```
-
-This starts:
-- SOCKS5 proxy on `127.0.0.1:1080`
-- HTTP proxy on `127.0.0.1:1081`
-
-**Dashboard mode** (web UI at `http://127.0.0.1:9099`):
+Start MIRAGE bridge:
 
 ```powershell
 .\miragec.exe
 ```
 
-**Flag reference:**
+Paste the `mirage://` URI from your VPS installer when prompted. After connection, `miragec` prints:
 
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `-c path` | — | Load client.json, run headless |
-| `-uri mirage://...` | — | Parse URI directly, run headless |
-| `-socks5 addr` | from config | Override SOCKS5 listen address |
-| `-http addr` | from config | Override HTTP listen address |
-| `-servers path` | `servers.json` next to exe | Dashboard mode profile file |
-| `-no-browser` | false | Suppress browser auto-open |
-
----
-
-### v2rayN integration
-
-Run `miragec.exe` in headless mode (SOCKS5 on `:1080`), then in v2rayN add a custom config:
-
-```json
-{
-  "inbounds": [
-    {"protocol": "socks", "port": 10808, "listen": "127.0.0.1",
-     "settings": {"auth": "noauth", "udp": false}}
-  ],
-  "outbounds": [
-    {"protocol": "socks",
-     "settings": {"servers": [{"address": "127.0.0.1", "port": 1080}]}}
-  ]
-}
+```text
+Clash URL   : http://127.0.0.1:9099/compat/mihomo.yaml
 ```
 
-v2rayN handles routing rules; MIRAGE handles the tunnel.
+In Clash Verge Rev:
 
----
+1. Add a profile from URL.
+2. Use `http://127.0.0.1:9099/compat/mihomo.yaml`.
+3. Update the profile after every MIRAGE restart or URI change.
+4. Enable Clash Verge Rev System Proxy or TUN.
 
-### Architecture
+The generated mihomo profile automatically adds a `DIRECT` rule for the active MIRAGE VPS address. This prevents Clash TUN from routing MIRAGE's own VPS connection back into MIRAGE.
 
-```
-[Windows]
-  miragec.exe
-  SOCKS5 :1080 / HTTP :1081
-       |
-       | TLS (uTLS Chrome profile)
-       | session_id = UID(4) + HMAC-token(28)
-       | record layer + Yamux
-       v
-[Linux VPS]
-  miraged
-       |
-       v
-  destination
-```
+Local endpoints while `miragec` is running:
 
----
+- SOCKS5: `127.0.0.1:1080`
+- HTTP: `127.0.0.1:1081`
+- Control API: `http://127.0.0.1:9099`
+- Clash Verge / mihomo profile: `http://127.0.0.1:9099/compat/mihomo.yaml`
+- v2rayN custom config bridge: `http://127.0.0.1:9099/compat/v2rayn.json`
 
-### Repository layout
+## CLI Modes
 
-```
-cmd/
-  miraged/        server entry point
-  miragec/        client entry point (headless + dashboard)
-internal/
-  client/         TLS dial, SOCKS5, HTTP proxy
-  server/         connection accept, auth routing, relay
-  protocol/       PSK → UID, HMAC token, session_id assembly
-  record/         framed transport with padding and heartbeat
-  mux/            Yamux multiplexer wrapper
-  uri/            mirage:// encode / decode
-  config/         JSON config loading and field parsing
-  dashboard/      web UI and REST control API
-  sysproxy/       Windows system proxy integration
-  tlspeek/        raw ClientHello parsing
-  replayconn/     ClientHello replay for server handshake
-  certutil/       TLS cert load/generate and SPKI pin
-install.sh        VPS one-command installer
-build.bat         Windows cross-compile helper
-```
-
----
-
-## 中文
-
-### MIRAGE 是什么
-
-MIRAGE 是一个抗审查代理。它把认证信息嵌进 TLS ClientHello 的 `session_id` 字段，流量看起来和普通 HTTPS 没有区别——没有额外握手，没有可识别的特征。
-
-- **`miraged`** — Linux VPS 服务端
-- **`miragec`** — Windows 代理核心（无界面 CLI 或 Web 面板）
-
----
-
-### VPS 部署（一条命令）
-
-```bash
-git clone https://github.com/WJSGZZ/MIRAGE.git
-cd MIRAGE
-bash install.sh 443
-```
-
-脚本会自动：
-
-1. 如果没有 Go 则自动安装
-2. 从源码编译 `miraged`
-3. 自动生成配置、TLS 证书、PSK 和 cert pin
-4. 自动探测公网 IP
-5. 打印最终 `mirage://` 口令
-6. 安装并启动 systemd 服务
-
-**端口选择** — 作为第一个参数传入，或不传进入交互菜单：
-
-```bash
-bash install.sh 443    # 标准 HTTPS 端口（推荐）
-bash install.sh 8443   # 备用 TLS 端口
-bash install.sh 80     # HTTP 端口，可绕过部分防火墙
-bash install.sh        # 交互菜单
-```
-
-> 需要 root 权限运行，且所选端口不能被占用。
-
-脚本结束时会显示：
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║            MIRAGE:// IMPORT TOKEN (save this!)              ║
-╠══════════════════════════════════════════════════════════════╣
-║  mirage://xxxx@1.2.3.4:443?sni=www.microsoft.com&cert_pin=...
-╚══════════════════════════════════════════════════════════════╝
-```
-
-保存这行口令，它包含服务器地址、PSK、cert pin 和 padding seed。
-
----
-
-### Windows 客户端
-
-在仓库根目录编译（需要 Go）：
-
-```powershell
-go build -o miragec.exe .\cmd\miragec
-```
-
-**无界面模式**（推荐——不开 UI，直接跑代理）：
-
-```powershell
-# 用 mirage:// 口令
-.\miragec.exe -uri "mirage://xxxx@1.2.3.4:443?..."
-
-# 用 client.json 文件
-.\miragec.exe -c client.json
-```
-
-启动后提供：
-- SOCKS5 代理 `127.0.0.1:1080`
-- HTTP 代理 `127.0.0.1:1081`
-
-**面板模式**（Web UI，访问 `http://127.0.0.1:9099`）：
+Interactive import and bridge mode:
 
 ```powershell
 .\miragec.exe
 ```
 
-**参数说明：**
+Scripted import and bridge mode:
 
-| 参数 | 默认值 | 用途 |
-|------|--------|------|
-| `-c 路径` | — | 加载 client.json，无界面运行 |
-| `-uri mirage://...` | — | 直接解析口令，无界面运行 |
-| `-socks5 地址` | 配置文件中的值 | 覆盖 SOCKS5 监听地址 |
-| `-http 地址` | 配置文件中的值 | 覆盖 HTTP 监听地址 |
-| `-servers 路径` | exe 同目录的 `servers.json` | 面板模式节点文件 |
-| `-no-browser` | false | 不自动打开浏览器 |
-
----
-
-### 配合 v2rayN 使用
-
-后台运行 `miragec.exe` 无界面模式（SOCKS5 在 `:1080`），然后在 v2rayN 中添加自定义配置：
-
-```json
-{
-  "inbounds": [
-    {"protocol": "socks", "port": 10808, "listen": "127.0.0.1",
-     "settings": {"auth": "noauth", "udp": false}}
-  ],
-  "outbounds": [
-    {"protocol": "socks",
-     "settings": {"servers": [{"address": "127.0.0.1", "port": 1080}]}}
-  ]
-}
+```powershell
+.\miragec.exe -core -servers servers.json -import-uri "mirage://..." -connect-last
 ```
 
-v2rayN 负责路由规则，MIRAGE 负责隧道传输。
+Run the bridge using existing `servers.json`:
 
----
-
-### 架构
-
-```
-[Windows]
-  miragec.exe
-  SOCKS5 :1080 / HTTP :1081
-       |
-       | TLS（uTLS Chrome 指纹）
-       | session_id = UID(4字节) + HMAC-token(28字节)
-       | record 层 + Yamux
-       v
-[Linux VPS]
-  miraged
-       |
-       v
-    目标站点
+```powershell
+.\miragec.exe -core -servers servers.json -dashboard 127.0.0.1:9099 -connect-last
 ```
 
----
+Legacy direct local proxy mode:
 
-### 仓库结构
-
+```powershell
+.\miragec.exe -uri "mirage://..."
 ```
+
+Legacy direct mode also avoids system proxy changes by default. Only use `-set-system-proxy` if you explicitly want MIRAGE itself to write Windows proxy settings.
+
+## Clash Troubleshooting
+
+If Clash imports the profile but traffic fails:
+
+- Refresh the Clash profile URL after restarting `miragec`.
+- Open `http://127.0.0.1:9099/compat/mihomo.yaml` and confirm your VPS IP appears before `MATCH,PROXY` as `DIRECT`.
+- If logs show `dial <your-vps-ip>:<port>`, the Clash profile is stale or the VPS bypass rule is missing.
+- If logs show `SPKI pin mismatch`, the URI cert pin does not match the server certificate.
+- If VPS logs show `uid not found`, the URI PSK/user material does not match the current server config.
+
+Basic local checks:
+
+```powershell
+curl.exe --socks5-hostname 127.0.0.1:1080 https://www.google.com -I
+curl.exe --proxy http://127.0.0.1:1081 https://api.openai.com -I
+curl.exe http://127.0.0.1:9099/compat/mihomo.yaml
+```
+
+## Repository Layout
+
+```text
 cmd/
-  miraged/        服务端入口
-  miragec/        客户端入口（无界面 + 面板）
+  miraged/              Linux server entry point
+  miragec/              Windows core/headless bridge entry point
 internal/
-  client/         TLS 拨号、SOCKS5、HTTP 代理
-  server/         连接接受、认证路由、中继
-  protocol/       PSK → UID、HMAC token、session_id 组装
-  record/         带 padding 和心跳的分帧传输层
-  mux/            Yamux 多路复用封装
-  uri/            mirage:// 编解码
-  config/         JSON 配置加载与字段解析
-  dashboard/      Web UI 与 REST 控制 API
-  sysproxy/       Windows 系统代理集成
-  tlspeek/        原始 ClientHello 解析
-  replayconn/     服务端握手重放连接
-  certutil/       TLS 证书加载/生成与 SPKI pin
-install.sh        VPS 一键安装脚本
-build.bat         Windows 交叉编译辅助脚本
+  client/               local SOCKS5/HTTP proxy and MIRAGE dialer
+  dashboard/            local control API and compatibility subscriptions
+  daemon/               local proxy runtime lifecycle and stats
+  server/               server accept/auth/relay runtime
+  sysproxy/             legacy Windows proxy helpers, disabled by default
+  tun/                  experimental code, not used by the recommended Clash flow
+  uri/                  mirage:// import/export
+install.sh              one-command VPS installer
+build.bat               Windows helper build script
+```
+
+## Build Checks
+
+```powershell
+go test ./...
+go build -o miragec.exe .\cmd\miragec
+go build -o miraged.exe .\cmd\miraged
+```
+
+On Linux:
+
+```bash
+go test ./...
+go build -o miraged ./cmd/miraged
 ```

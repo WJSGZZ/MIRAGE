@@ -1,8 +1,7 @@
 //go:build windows
 
-// Package tun sets up a WinTun-based TUN device and routes all traffic
-// through a local SOCKS5 proxy, capturing traffic from every process.
-// It uses github.com/xjasonlyu/tun2socks for the gVisor TCP/IP stack.
+// Package tun sets up a WinTun-based TUN device and routes traffic through the
+// local MIRAGE SOCKS5 proxy.
 package tun
 
 import (
@@ -12,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,10 +24,9 @@ const (
 	tunMask = "255.254.0.0"
 )
 
-// Start creates the TUN device and redirects all traffic through socks5Addr.
-// vpsIP is the bare IP of the VPS server — it gets a dedicated route via the
-// original gateway so the MIRAGE connection itself never loops through the TUN.
-// Requires wintun.dll next to miragec.exe and administrator privileges.
+// Start creates the TUN device and redirects IPv4 traffic through socks5Addr.
+// vpsIP is protected through the original gateway so MIRAGE never loops through
+// its own TUN route.
 func Start(socks5Addr, vpsIP string) error {
 	if err := checkWintun(); err != nil {
 		return err
@@ -37,7 +36,7 @@ func Start(socks5Addr, vpsIP string) error {
 	if err != nil {
 		return fmt.Errorf("tun: detect default gateway: %w", err)
 	}
-	log.Printf("miragec: TUN mode  gateway=%s  VPS=%s", gw, vpsIP)
+	log.Printf("miragec: TUN mode gateway=%s VPS=%s", gw, vpsIP)
 
 	engine.Insert(&engine.Key{
 		Device:   "tun://" + tunName,
@@ -45,11 +44,9 @@ func Start(socks5Addr, vpsIP string) error {
 		LogLevel: "warn",
 		MTU:      1500,
 	})
-	engine.Start() // fatal on error (wintun load failure, permission, etc.)
+	engine.Start()
 
-	// Give the TUN interface a moment to register with Windows before netsh.
-	time.Sleep(600 * time.Millisecond)
-
+	time.Sleep(900 * time.Millisecond)
 	if err := setupRoutes(vpsIP, gw); err != nil {
 		engine.Stop()
 		return fmt.Errorf("tun: route setup: %w", err)
@@ -57,24 +54,26 @@ func Start(socks5Addr, vpsIP string) error {
 	return nil
 }
 
-// Stop tears down the TUN device and restores original routing.
+// Stop tears down the TUN device and restores MIRAGE-managed routes.
 func Stop(vpsIP string) {
 	teardownRoutes(vpsIP)
 	engine.Stop()
 	log.Println("miragec: TUN stopped")
 }
 
-// setupRoutes assigns the TUN interface an IP and installs routes:
-//   - VPS IP  →  original gateway  (prevents routing loop)
-//   - 0.0.0.0/0 →  TUN  (captures all other traffic)
+var dnsServers = []string{"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"}
+
 func setupRoutes(vpsIP, gw string) error {
+	ifIndex, err := interfaceIndex(tunName)
+	if err != nil {
+		return err
+	}
 	cmds := [][]string{
-		// Assign IP to the TUN interface
 		{"netsh", "interface", "ip", "set", "address", tunName, "static", tunIP, tunMask},
-		// Protect the VPS route so MIRAGE's own TCP connection never hits the TUN
+		{"netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1"},
 		{"route", "ADD", vpsIP, "MASK", "255.255.255.255", gw},
-		// Default route via TUN — lowest metric wins
-		{"route", "ADD", "0.0.0.0", "MASK", "0.0.0.0", tunIP, "METRIC", "1"},
+		{"route", "ADD", "0.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", strconv.Itoa(ifIndex), "METRIC", "1"},
+		{"route", "ADD", "128.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", strconv.Itoa(ifIndex), "METRIC", "1"},
 	}
 	for _, argv := range cmds {
 		out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
@@ -82,19 +81,43 @@ func setupRoutes(vpsIP, gw string) error {
 			return fmt.Errorf("command %q: %w (output: %s)", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 		}
 	}
+	for _, dns := range dnsServers {
+		exec.Command("route", "ADD", dns, "MASK", "255.255.255.255", gw).Run() //nolint:errcheck
+	}
+	exec.Command("netsh", "interface", "ip", "set", "dns", tunName, "static", "8.8.8.8").Run() //nolint:errcheck
 	return nil
 }
 
 func teardownRoutes(vpsIP string) {
-	exec.Command("route", "DELETE", vpsIP, "MASK", "255.255.255.255").Run()          //nolint:errcheck
-	exec.Command("route", "DELETE", "0.0.0.0", "MASK", "0.0.0.0", tunIP).Run()      //nolint:errcheck
+	exec.Command("route", "DELETE", vpsIP, "MASK", "255.255.255.255").Run()    //nolint:errcheck
+	exec.Command("route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0").Run()      //nolint:errcheck
+	exec.Command("route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0").Run()    //nolint:errcheck
+	exec.Command("route", "DELETE", "0.0.0.0", "MASK", "0.0.0.0", tunIP).Run() //nolint:errcheck
+	for _, dns := range dnsServers {
+		exec.Command("route", "DELETE", dns, "MASK", "255.255.255.255").Run() //nolint:errcheck
+	}
+	exec.Command("netsh", "interface", "ip", "set", "dns", tunName, "dhcp").Run() //nolint:errcheck
 }
 
-// defaultGateway returns the current default IPv4 gateway using PowerShell.
+func interfaceIndex(name string) (int, error) {
+	out, err := exec.Command(
+		"powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("(Get-NetAdapter -Name '%s' -ErrorAction Stop).ifIndex", strings.ReplaceAll(name, "'", "''")),
+	).Output()
+	if err != nil {
+		return 0, fmt.Errorf("tun: find interface index for %s: %w", name, err)
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || idx <= 0 {
+		return 0, fmt.Errorf("tun: invalid interface index for %s: %q", name, strings.TrimSpace(string(out)))
+	}
+	return idx, nil
+}
+
 func defaultGateway() (string, error) {
 	out, err := exec.Command(
 		"powershell", "-NoProfile", "-Command",
-		"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object -Property { $_.InterfaceMetric + $_.RouteMetric } | Select-Object -First 1).NextHop",
+		"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' } | Sort-Object -Property { $_.InterfaceMetric + $_.RouteMetric } | Select-Object -First 1).NextHop",
 	).Output()
 	if err != nil {
 		return "", err
@@ -106,8 +129,6 @@ func defaultGateway() (string, error) {
 	return gw, nil
 }
 
-// checkWintun looks for wintun.dll next to the executable or in the current
-// directory. wintun.dll is required by the wireguard-go TUN driver on Windows.
 func checkWintun() error {
 	exe, _ := os.Executable()
 	for _, dir := range []string{filepath.Dir(exe), "."} {
@@ -116,7 +137,7 @@ func checkWintun() error {
 		}
 	}
 	return fmt.Errorf(
-		"TUN mode requires wintun.dll — download from https://www.wintun.net/\n" +
+		"TUN mode requires wintun.dll. Download it from https://www.wintun.net/\n" +
 			"  Place wintun.dll in the same folder as miragec.exe and retry.",
 	)
 }

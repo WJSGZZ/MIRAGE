@@ -3,6 +3,8 @@
 /miraged.exe
 /miragec
 /miragec.exe
+*.exe~
+/wintun.dll
 
 # TLS certificates (auto-generated, must not be committed)
 *.pem
@@ -11,15 +13,21 @@
 config.json
 client.json
 servers.json
+servers.json.proxy.json
 bootstrap.txt
 
-# Go build cache
-go.sum
+# Go dependency locks are committed for reproducible VPS builds.
 
 # OS
 .DS_Store
 Thumbs.db
 
 # desktop build output
+/MirageClient.Tauri/
 **/bin/
 **/obj/
+*.csproj.user
+**/node_modules/
+**/dist/
+**/src-tauri/target/
+**/src-tauri/gen/schemas/
