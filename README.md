@@ -5,8 +5,6 @@
   <a href="#english">English</a>
 </p>
 
-> GitHub README files do not allow JavaScript, so MIRAGE uses reliable anchor-based language switching. Click a language above to jump to that section.
-
 ---
 
 ## 中文
