@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+
 type Session struct {
 	sess *yamux.Session
 }
@@ -22,6 +23,7 @@ type Stream struct {
 func NewClientSession(conn net.Conn) *Session {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
+	cfg.LogOutput = io.Discard
 	sess, err := yamux.Client(conn, cfg)
 	if err != nil {
 		return &Session{}
@@ -32,6 +34,7 @@ func NewClientSession(conn net.Conn) *Session {
 func NewServerSession(conn net.Conn) *Session {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
+	cfg.LogOutput = io.Discard
 	sess, err := yamux.Server(conn, cfg)
 	if err != nil {
 		return &Session{}

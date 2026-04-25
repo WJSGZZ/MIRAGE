@@ -14,11 +14,11 @@ func TestConnRoundTripStripsPaddingAndHeartbeat(t *testing.T) {
 	defer right.Close()
 
 	seed := bytes.Repeat([]byte{0x11}, 16)
-	client, err := NewConn(left, seed)
+	client, err := NewConn(left, nil, seed)
 	if err != nil {
 		t.Fatalf("NewConn(client): %v", err)
 	}
-	server, err := NewConn(right, seed)
+	server, err := NewConn(right, nil, seed)
 	if err != nil {
 		t.Fatalf("NewConn(server): %v", err)
 	}
@@ -36,6 +36,13 @@ func TestConnRoundTripStripsPaddingAndHeartbeat(t *testing.T) {
 	if _, err := io.ReadFull(server, got); err != nil {
 		t.Fatalf("ReadFull(server): %v", err)
 	}
+	// Drain any trailing padding frame that client.Write may still be sending.
+	// Without this, client.Write blocks on the last padding frame write after
+	// io.ReadFull has already collected all data bytes and stopped reading.
+	server.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	io.Copy(io.Discard, server)
+	server.SetReadDeadline(time.Time{})
+
 	if err := <-errCh; err != nil {
 		t.Fatalf("Write(client): %v", err)
 	}
@@ -50,7 +57,7 @@ func TestConnDiscardsUnknownAndPaddingFrames(t *testing.T) {
 	defer right.Close()
 
 	seed := bytes.Repeat([]byte{0x22}, 16)
-	reader, err := NewConn(left, seed)
+	reader, err := NewConn(left, nil, seed)
 	if err != nil {
 		t.Fatalf("NewConn: %v", err)
 	}

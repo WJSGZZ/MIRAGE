@@ -26,13 +26,28 @@ type PadParams struct {
 	InsertProb uint32
 }
 
-func DeriveUID(psk []byte) ([4]byte, error) {
+// UIDHourWindow returns the hour-granularity time window index for rolling UID
+// derivation. Pass time.Now().Unix() on both client and server.
+func UIDHourWindow(unixSecs int64) int64 {
+	if unixSecs < 0 {
+		return 0
+	}
+	return unixSecs / 3600
+}
+
+// DeriveUID derives the 4-byte user identifier for the given hour window.
+// tUID must come from UIDHourWindow(time.Now().Unix()); the UID rotates every
+// hour so cross-session clustering is infeasible.
+func DeriveUID(psk []byte, tUID int64) ([4]byte, error) {
 	var uid [4]byte
 	if len(psk) == 0 {
 		return uid, fmt.Errorf("derive uid: empty psk")
 	}
+	var tBytes [8]byte
+	binary.BigEndian.PutUint64(tBytes[:], uint64(tUID))
 	h := blake3.NewDeriveKey(UIDContext)
 	_, _ = h.Write(psk)
+	_, _ = h.Write(tBytes[:])
 	copy(uid[:], h.Sum(nil))
 	return uid, nil
 }

@@ -10,13 +10,15 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"miraged/internal/protocol"
 )
 
 // ServerUser is one authorised client account on the server.
 //
-// v0 prototype uses ShortID. The spec-aligned model uses PSK -> UID.
+// v0 prototype uses ShortID. The spec-aligned model uses PSK -> rolling UID.
 // Both are kept here temporarily so the repo can migrate incrementally.
 type ServerUser struct {
 	Name    string `json:"name"`
@@ -24,7 +26,6 @@ type ServerUser struct {
 	ShortID string `json:"shortId,omitempty"`
 
 	PSKBytes     []byte
-	UID          [4]byte
 	ShortIDBytes []byte
 }
 
@@ -56,7 +57,14 @@ type ServerConfig struct {
 
 	// Parsed spec-aligned fields.
 	ServerPaddingSeedBytes [16]byte
-	UserByUID              map[[4]byte]*ServerUser
+	hasPSKUsers            bool
+
+	// Rolling UID maps (T-1 / T / T+1 hour windows), rebuilt hourly.
+	// Protected by mapsMu; never access the maps directly outside this file.
+	mapsMu  sync.RWMutex
+	uidPrev map[[4]byte]*ServerUser
+	uidCurr map[[4]byte]*ServerUser
+	uidNext map[[4]byte]*ServerUser
 }
 
 // ClientConfig is loaded from the client's client.json.
@@ -163,12 +171,70 @@ func (c *ServerConfig) FindUser(shortID []byte) *ServerUser {
 	return nil
 }
 
-// FindUserByUID returns the spec-aligned user indexed by derived UID.
+// HasPSKUsers reports whether any user has a PSK configured.
+func (c *ServerConfig) HasPSKUsers() bool {
+	return c != nil && c.hasPSKUsers
+}
+
+// FindUserByUID looks up the user across T-1/T/T+1 hour windows (curr first).
 func (c *ServerConfig) FindUserByUID(uid [4]byte) *ServerUser {
-	if c == nil || c.UserByUID == nil {
+	if c == nil {
 		return nil
 	}
-	return c.UserByUID[uid]
+	c.mapsMu.RLock()
+	defer c.mapsMu.RUnlock()
+	if u := c.uidCurr[uid]; u != nil {
+		return u
+	}
+	if u := c.uidPrev[uid]; u != nil {
+		return u
+	}
+	return c.uidNext[uid]
+}
+
+// RebuildUserMaps rebuilds the T-1/T/T+1 UID lookup maps for the given time.
+// Safe to call concurrently; uses a write-lock for the swap.
+func (c *ServerConfig) RebuildUserMaps(now time.Time) error {
+	tCurr := protocol.UIDHourWindow(now.Unix())
+	prev, err := buildWindowMap(c.Users, tCurr-1)
+	if err != nil {
+		return fmt.Errorf("uid map T-1: %w", err)
+	}
+	curr, err := buildWindowMap(c.Users, tCurr)
+	if err != nil {
+		return fmt.Errorf("uid map T: %w", err)
+	}
+	next, err := buildWindowMap(c.Users, tCurr+1)
+	if err != nil {
+		return fmt.Errorf("uid map T+1: %w", err)
+	}
+	c.mapsMu.Lock()
+	c.uidPrev = prev
+	c.uidCurr = curr
+	c.uidNext = next
+	c.mapsMu.Unlock()
+	return nil
+}
+
+// buildWindowMap derives UIDs for all PSK users at a specific hour window and
+// returns the resulting map. Fails fast on any UID collision within the window.
+func buildWindowMap(users []ServerUser, tUID int64) (map[[4]byte]*ServerUser, error) {
+	m := make(map[[4]byte]*ServerUser, len(users))
+	for i := range users {
+		u := &users[i]
+		if len(u.PSKBytes) == 0 {
+			continue
+		}
+		uid, err := protocol.DeriveUID(u.PSKBytes, tUID)
+		if err != nil {
+			return nil, fmt.Errorf("user %q: %w", u.Name, err)
+		}
+		if prev, exists := m[uid]; exists {
+			return nil, fmt.Errorf("uid collision at window %d between %q and %q — change a PSK and redeploy", tUID, prev.Name, u.Name)
+		}
+		m[uid] = u
+	}
+	return m, nil
 }
 
 func (cfg *ServerConfig) normalizeServer() error {
@@ -252,7 +318,6 @@ func parseServerPaddingSeed(cfg *ServerConfig) error {
 }
 
 func parseServerUsers(cfg *ServerConfig) error {
-	cfg.UserByUID = make(map[[4]byte]*ServerUser, len(cfg.Users))
 	for i := range cfg.Users {
 		u := &cfg.Users[i]
 		if strings.TrimSpace(u.Name) == "" {
@@ -267,15 +332,7 @@ func parseServerUsers(cfg *ServerConfig) error {
 				return fmt.Errorf("user %d psk: must be 32 bytes", i)
 			}
 			u.PSKBytes = psk
-			uid, err := protocol.DeriveUID(psk)
-			if err != nil {
-				return fmt.Errorf("user %d uid: %w", i, err)
-			}
-			u.UID = uid
-			if prev, exists := cfg.UserByUID[uid]; exists {
-				return fmt.Errorf("uid collision between users %q and %q", prev.Name, u.Name)
-			}
-			cfg.UserByUID[uid] = u
+			cfg.hasPSKUsers = true
 		}
 
 		if strings.TrimSpace(u.ShortID) == "" {
@@ -289,6 +346,11 @@ func parseServerUsers(cfg *ServerConfig) error {
 			return fmt.Errorf("user %d shortId: must be 1-8 bytes", i)
 		}
 		u.ShortIDBytes = shortIDBytes
+	}
+	if cfg.hasPSKUsers {
+		if err := cfg.RebuildUserMaps(time.Now()); err != nil {
+			return fmt.Errorf("initial uid map build: %w", err)
+		}
 	}
 	return nil
 }

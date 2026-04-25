@@ -10,6 +10,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"miraged/internal/protocol"
@@ -22,6 +23,9 @@ const (
 
 	maxDataPayload = 16383
 	frameHeaderLen = 3
+
+	deadPeerTimeout = 90 * time.Second
+	deadPeerCheck   = 10 * time.Second
 )
 
 type Conn struct {
@@ -38,11 +42,19 @@ type Conn struct {
 
 	frameCount uint32
 
-	closeOnce sync.Once
-	closeCh   chan struct{}
+	// lastSeen tracks the unix timestamp of the most recent received frame.
+	// Updated by readFrame; checked by heartbeatLoop for dead-peer detection.
+	lastSeen atomic.Int64
+
+	closeOnce     sync.Once
+	closeCh       chan struct{}
+	heartbeatDone chan struct{}
 }
 
-func NewConn(raw net.Conn, seed []byte) (*Conn, error) {
+// NewConn wraps raw in a MIRAGE record-layer connection. psk is the user's
+// pre-shared key used to derive padding parameters (may be nil for legacy
+// connections, which will use default params). seed must be exactly 16 bytes.
+func NewConn(raw net.Conn, psk, seed []byte) (*Conn, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("record: nil conn")
 	}
@@ -52,7 +64,7 @@ func NewConn(raw net.Conn, seed []byte) (*Conn, error) {
 
 	var seedArr [16]byte
 	copy(seedArr[:], seed)
-	params, err := protocol.DerivePaddingParams(seed[:], seed[:])
+	params, err := protocol.DerivePaddingParams(psk, seed)
 	if err != nil {
 		params = protocol.PadParams{
 			PaddingMin: 0,
@@ -68,12 +80,14 @@ func NewConn(raw net.Conn, seed []byte) (*Conn, error) {
 	}
 
 	c := &Conn{
-		raw:     raw,
-		rng:     mathrand.New(mathrand.NewSource(rngSeed)),
-		params:  params,
-		seed:    seedArr,
-		closeCh: make(chan struct{}),
+		raw:           raw,
+		rng:           mathrand.New(mathrand.NewSource(rngSeed)),
+		params:        params,
+		seed:          seedArr,
+		closeCh:       make(chan struct{}),
+		heartbeatDone: make(chan struct{}),
 	}
+	c.lastSeen.Store(time.Now().Unix())
 	go c.heartbeatLoop()
 	return c, nil
 }
@@ -131,7 +145,11 @@ func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
+		// Close raw conn first so any in-progress heartbeat write unblocks with
+		// an error; otherwise <-heartbeatDone would deadlock waiting for a write
+		// that can never complete.
 		err = c.raw.Close()
+		<-c.heartbeatDone // wait for goroutine to confirm exit
 	})
 	return err
 }
@@ -143,16 +161,35 @@ func (c *Conn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadlin
 func (c *Conn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
 
 func (c *Conn) heartbeatLoop() {
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
-
+	defer close(c.heartbeatDone)
+	deadCheck := time.NewTicker(deadPeerCheck)
+	defer deadCheck.Stop()
 	for {
+		// Random interval 25~35 s (spec §8.5)
+		interval := 25*time.Second + time.Duration(c.randInt(10001))*time.Millisecond
+		t := time.NewTimer(interval)
 		select {
-		case <-ticker.C:
+		case <-t.C:
+			// Payload: 16~128 crypto/rand bytes (length itself is part of obfuscation)
+			size := 16 + c.randInt(113)
+			payload := make([]byte, size)
+			if _, err := rand.Read(payload); err != nil {
+				return
+			}
 			c.writeMu.Lock()
-			_ = c.writeFrame(TypeHeartbeat, nil)
+			_ = c.writeFrame(TypeHeartbeat, payload)
 			c.writeMu.Unlock()
+
+		case <-deadCheck.C:
+			t.Stop()
+			// Dead peer detection (spec §8.5): close if no frame received for 90 s.
+			if time.Duration(time.Now().Unix()-c.lastSeen.Load())*time.Second > deadPeerTimeout {
+				_ = c.raw.Close()
+				return
+			}
+
 		case <-c.closeCh:
+			t.Stop()
 			return
 		}
 	}
@@ -164,13 +201,15 @@ func (c *Conn) readFrame() (byte, []byte, error) {
 		return 0, nil, err
 	}
 	length := int(binary.BigEndian.Uint16(hdr[0:2]))
-	if length < 0 || length > maxDataPayload {
+	if length > maxDataPayload {
 		return 0, nil, fmt.Errorf("record: invalid frame length %d", length)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(c.raw, payload); err != nil {
 		return 0, nil, err
 	}
+	// Any valid frame updates the dead-peer timestamp (spec §8.5).
+	c.lastSeen.Store(time.Now().Unix())
 	return hdr[2], payload, nil
 }
 
@@ -236,11 +275,12 @@ func (c *Conn) nextChunkSize(available int) int {
 		limit = maxDataPayload
 	}
 
+	// Spec §8.3: Chrome-reference distribution (weights 35/40/25).
 	type span struct{ min, max int }
 	regions := []span{
-		{min: 256, max: 1200},
-		{min: 1201, max: 4096},
-		{min: 4097, max: 12000},
+		{min: 100, max: 1400},
+		{min: 1400, max: 8192},
+		{min: 8192, max: 16383},
 	}
 	weights := []int{35, 40, 25}
 

@@ -100,7 +100,7 @@ func (c *Client) connect() (*mux.Session, error) {
 
 	log.Printf("miragec: session established")
 	if cfg.ClientPaddingSeedBytes != ([16]byte{}) {
-		recordConn, err := record.NewConn(transport, cfg.ClientPaddingSeedBytes[:])
+		recordConn, err := record.NewConn(transport, cfg.PSKBytes, cfg.ClientPaddingSeedBytes[:])
 		if err != nil {
 			transport.Close()
 			return nil, fmt.Errorf("client: record conn: %w", err)
@@ -161,7 +161,7 @@ func (c *Client) connectSpec(rawConn net.Conn) (net.Conn, error) {
 		return nil, fmt.Errorf("client: set client random: %w", err)
 	}
 
-	uid, err := protocol.DeriveUID(cfg.PSKBytes)
+	uid, err := protocol.DeriveUID(cfg.PSKBytes, protocol.UIDHourWindow(time.Now().Unix()))
 	if err != nil {
 		return nil, fmt.Errorf("client: derive uid: %w", err)
 	}

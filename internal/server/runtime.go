@@ -43,6 +43,10 @@ func (rt *runtimeState) run() error {
 	if rt.cfg.Fallback != "" {
 		log.Printf("miraged: fallback target %s", rt.cfg.Fallback)
 	}
+	if rt.cfg.HasPSKUsers() {
+		go rt.hourlyRebuildLoop()
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -50,6 +54,21 @@ func (rt *runtimeState) run() error {
 			continue
 		}
 		go rt.handleConn(conn)
+	}
+}
+
+// hourlyRebuildLoop wakes at each hour boundary (+5 s buffer) and rebuilds the
+// T-1/T/T+1 UID maps so rolling UIDs stay valid across hour transitions.
+func (rt *runtimeState) hourlyRebuildLoop() {
+	for {
+		now := time.Now()
+		next := now.Truncate(time.Hour).Add(time.Hour + 5*time.Second)
+		time.Sleep(time.Until(next))
+		if err := rt.cfg.RebuildUserMaps(time.Now()); err != nil {
+			log.Printf("miraged: hourly uid rebuild failed: %v", err)
+		} else {
+			log.Printf("miraged: uid maps rebuilt for hour window %d", time.Now().Unix()/3600)
+		}
 	}
 }
 
@@ -82,7 +101,7 @@ func (rt *runtimeState) handleConn(rawConn net.Conn) {
 }
 
 func (rt *runtimeState) canTrySpecAuth() bool {
-	return len(rt.cfg.UserByUID) > 0
+	return rt.cfg.HasPSKUsers()
 }
 
 func (rt *runtimeState) canTryLegacyAuth() bool {
@@ -142,7 +161,7 @@ func (rt *runtimeState) trySpecHandshake(rawConn net.Conn, hello *tlspeek.Client
 	_ = tlsConn.SetDeadline(time.Time{})
 
 	log.Printf("miraged: spec session established for %s uid=%x sni=%s", user.Name, uid, hello.ServerName)
-	return true, rt.serveEstablished(tlsConn, rt.cfg.ServerPaddingSeedBytes[:], false)
+	return true, rt.serveEstablished(tlsConn, user.PSKBytes, rt.cfg.ServerPaddingSeedBytes[:], false)
 }
 
 func (rt *runtimeState) handleLegacyTLS(rawConn net.Conn, prefix []byte) {
@@ -170,17 +189,17 @@ func (rt *runtimeState) handleLegacyTLS(rawConn net.Conn, prefix []byte) {
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 	log.Printf("miraged: legacy session established")
-	_ = rt.serveEstablished(tlsConn, rt.cfg.ServerPaddingSeedBytes[:], true)
+	_ = rt.serveEstablished(tlsConn, nil, rt.cfg.ServerPaddingSeedBytes[:], true)
 }
 
-func (rt *runtimeState) serveEstablished(conn net.Conn, seed []byte, closeUnderlying bool) error {
+func (rt *runtimeState) serveEstablished(conn net.Conn, psk, seed []byte, closeUnderlying bool) error {
 	if closeUnderlying {
 		defer conn.Close()
 	}
 
 	transport := conn
 	if len(seed) == 16 {
-		recordConn, err := record.NewConn(conn, seed)
+		recordConn, err := record.NewConn(conn, psk, seed)
 		if err != nil {
 			return err
 		}
@@ -256,10 +275,16 @@ func (rt *runtimeState) rememberReplay(key [32]byte) bool {
 		return false
 	}
 	if capHint := rt.cfg.ReplayCacheCap; capHint > 0 && len(rt.replayCache) >= capHint {
-		for k := range rt.replayCache {
-			delete(rt.replayCache, k)
-			break
+		// LRU eviction: since TTL is fixed, smallest expiry == oldest entry.
+		var lruKey [32]byte
+		var lruExp time.Time
+		for k, exp := range rt.replayCache {
+			if lruExp.IsZero() || exp.Before(lruExp) {
+				lruKey = k
+				lruExp = exp
+			}
 		}
+		delete(rt.replayCache, lruKey)
 	}
 	rt.replayCache[key] = now.Add(ttl)
 	return true
