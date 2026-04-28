@@ -66,7 +66,11 @@ func (rt *runtimeState) hourlyRebuildLoop() {
 		next := now.Truncate(time.Hour).Add(time.Hour + 5*time.Second)
 		time.Sleep(time.Until(next))
 		if err := rt.cfg.RebuildUserMaps(time.Now()); err != nil {
-			log.Printf("miraged: hourly uid rebuild failed: %v", err)
+			// A UID collision after deployment means two users now share an
+			// identifier — one of them would silently authenticate as the other.
+			// This is a critical security failure; shut down immediately so the
+			// operator notices and rotates the offending PSK.
+			log.Fatalf("miraged: uid collision detected during hourly rebuild, shutting down: %v", err)
 		} else {
 			log.Printf("miraged: uid maps rebuilt for hour window %d", time.Now().Unix()/3600)
 		}
