@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -1110,7 +1111,7 @@ func (m *memoryLog) Since(since time.Time) []logEntry {
 }
 
 func errorsIs(err error, target error) bool {
-	return err != nil && target != nil && os.IsNotExist(err)
+	return errors.Is(err, target)
 }
 
 func probeListener(name, addr string) listenerStatus {

@@ -59,7 +59,15 @@ func normalizeProxyConfig(cfg proxyConfig) proxyConfig {
 }
 
 func (dash *Dashboard) loadProxyConfig() {
-	dash.proxyCfg = defaultProxyConfig()
+	// Bridge mode is the only mode miragec supports; never load a non-manual
+	// config from disk regardless of what proxy.json says.  This ensures that
+	// even a hand-edited or leftover proxy.json with mode="system"/"tun"/etc.
+	// cannot cause MIRAGE to touch Windows system proxy, WinHTTP, environment
+	// variables, or TUN on startup.
+	dash.proxyCfg = defaultProxyConfig() // always "manual"
+	if dash.bridgeMode {
+		return
+	}
 	data, err := os.ReadFile(dash.proxyFile)
 	if err != nil {
 		return
