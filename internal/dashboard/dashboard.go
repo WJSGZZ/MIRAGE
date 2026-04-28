@@ -51,8 +51,8 @@ type ListenerStatus = listenerStatus
 type TestResult = testResult
 
 const (
-	coreVersion     = "0.2.0-dev"
-	protocolVersion = "MIRAGE-SPEC-001 1.0.4-draft"
+	coreVersion     = "1.2.1"
+	protocolVersion = "MIRAGE-SPEC-001 1.0.6-draft"
 )
 
 // Dashboard owns the HTTP mux, daemon, and persisted server list.

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2-blue?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.1-blue?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="go version">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="platform">
   <img src="https://img.shields.io/badge/license-MPL--2.0-green?style=flat-square" alt="license">
