@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0-blue?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2-blue?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="go version">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="platform">
-  <img src="https://img.shields.io/badge/license-private-red?style=flat-square" alt="license">
+  <img src="https://img.shields.io/badge/license-MPL--2.0-green?style=flat-square" alt="license">
 </p>
 
 <h1 align="center">MIRAGE</h1>
@@ -79,7 +79,7 @@ MIRAGE 的 TLS 握手通过 **uTLS** 框架精确仿真主流浏览器的握手�
 #### 安全性质
 
 | 性质 | 说明 |
-|---|---|
+| :--- | :--- |
 | 外层不可区分 | 握手特征与真实 Chrome 浏览器一致 |
 | 后量子安全 | 密钥交换支持 X25519MLKEM768 |
 | 抗主动探测 | 认证失败路径与真实目标站响应一致，无协议泄露 |
@@ -108,7 +108,7 @@ bash install.sh 8443
 
 #### 第二步：Windows 客户端
 
-运行 `miragec.exe`，按向导提示粘贴上一步获得的 `mirage://` 口令，即可完成连接配置。
+从 [Releases](https://github.com/WJSGZZ/MIRAGE/releases) 下载最新的 `miragec.exe`，运行后按向导提示粘贴上一步获得的 `mirage://` 口令，即可完成连接配置。
 
 向导完成后会显示本地订阅地址，将其导入 **Clash Verge Rev** 即可开始使用。
 
@@ -117,7 +117,7 @@ bash install.sh 8443
 ### 本地端点
 
 | 用途 | 地址 |
-|---|---|
+| :--- | :--- |
 | SOCKS5 代理 | `127.0.0.1:1080` |
 | HTTP 代理 | `127.0.0.1:1081` |
 | Clash / mihomo 订阅 | `http://127.0.0.1:9099/compat/mihomo.yaml` |
@@ -172,14 +172,14 @@ Application traffic
 The MIRAGE protocol stack consists of three layers with strictly separated responsibilities:
 
 ```
-┌─────────────────────────────────┐
-│      Multiplexing (Yamux)        │  concurrent stream management, zero protocol exposure
-├─────────────────────────────────┤
-│      Record Layer                │  chunking · padding · heartbeat · traffic shaping
-├─────────────────────────────────┤
-│      Outer Encryption (TLS 1.3)  │  sole encryption layer, emulating real browser fingerprint
-└─────────────────────────────────┘
-               │ TCP
+┌──────────────────────────────────┐
+│      Multiplexing  (Yamux)       │  concurrent stream management, zero protocol exposure
+├──────────────────────────────────┤
+│         Record Layer             │  chunking · padding · heartbeat · traffic shaping
+├──────────────────────────────────┤
+│   Outer Encryption  (TLS 1.3)    │  sole encryption layer, browser fingerprint emulation
+└──────────────────────────────────┘
+                │ TCP
 ```
 
 Each layer has a single, non-overlapping responsibility: encryption belongs exclusively to TLS, traffic shaping belongs exclusively to the record layer, and congestion control belongs exclusively to TCP.
@@ -208,7 +208,7 @@ The sender and receiver operate with fully independent shaping parameters, each 
 #### Security Properties
 
 | Property | Description |
-|---|---|
+| :--- | :--- |
 | Outer indistinguishability | Handshake characteristics match real Chrome browser behavior |
 | Post-quantum security | Key exchange supports X25519MLKEM768 |
 | Active probe resistance | Authentication failure path is identical to the real destination response; no protocol leakage |
@@ -237,7 +237,7 @@ When the script completes, a `mirage://` URI is printed to the terminal. Save it
 
 #### Step 2: Windows Client
 
-Run `miragec.exe` and follow the on-screen wizard. When prompted, paste the `mirage://` URI from the previous step.
+Download the latest `miragec.exe` from [Releases](https://github.com/WJSGZZ/MIRAGE/releases), run it, and follow the on-screen wizard. When prompted, paste the `mirage://` URI from the previous step.
 
 The wizard will confirm the connection and display the local subscription URL. Import that URL into **Clash Verge Rev** to complete setup.
 
@@ -246,7 +246,7 @@ The wizard will confirm the connection and display the local subscription URL. I
 ### Local Endpoints
 
 | Purpose | Address |
-|---|---|
+| :--- | :--- |
 | SOCKS5 proxy | `127.0.0.1:1080` |
 | HTTP proxy | `127.0.0.1:1081` |
 | Clash / mihomo subscription | `http://127.0.0.1:9099/compat/mihomo.yaml` |
