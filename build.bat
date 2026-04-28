@@ -6,6 +6,15 @@ echo [*] Downloading dependencies...
 go mod tidy
 
 echo.
+echo [*] Embedding application icon...
+where rsrc >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo     rsrc not found, installing...
+    go install github.com/akavel/rsrc@latest
+)
+rsrc -ico assets/logo.ico -o cmd/miragec/rsrc.syso
+if %ERRORLEVEL% NEQ 0 goto fail
+
 echo [*] Building miragec.exe (Windows client core)...
 set GOOS=windows
 set GOARCH=amd64

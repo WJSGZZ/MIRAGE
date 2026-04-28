@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/logo.png" width="120" alt="MIRAGE logo">
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/version-1.2-blue?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="go version">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="platform">
