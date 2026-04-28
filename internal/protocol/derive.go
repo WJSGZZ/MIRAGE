@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -91,8 +92,9 @@ func DeriveHMACToken(psk []byte, timeWindow int64, clientRandom [32]byte) ([28]b
 	var msg [40]byte
 	binary.BigEndian.PutUint64(msg[0:8], uint64(timeWindow))
 	copy(msg[8:], clientRandom[:])
-	mac := hmacSHA256(psk, msg[:])
-	copy(out[:], mac[:28])
+	mac := hmac.New(sha256.New, psk)
+	mac.Write(msg[:])
+	copy(out[:], mac.Sum(nil))
 	return out, nil
 }
 
@@ -142,32 +144,3 @@ func ParseBase64URLNoPad(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-func hmacSHA256(key, msg []byte) [32]byte {
-	const blockSize = 64
-	if len(key) > blockSize {
-		sum := sha256.Sum256(key)
-		key = sum[:]
-	}
-	k := make([]byte, blockSize)
-	copy(k, key)
-
-	ipad := make([]byte, blockSize)
-	opad := make([]byte, blockSize)
-	for i := 0; i < blockSize; i++ {
-		ipad[i] = k[i] ^ 0x36
-		opad[i] = k[i] ^ 0x5c
-	}
-
-	inner := sha256.New()
-	_, _ = inner.Write(ipad)
-	_, _ = inner.Write(msg)
-	innerSum := inner.Sum(nil)
-
-	outer := sha256.New()
-	_, _ = outer.Write(opad)
-	_, _ = outer.Write(innerSum)
-
-	var out [32]byte
-	copy(out[:], outer.Sum(nil))
-	return out
-}

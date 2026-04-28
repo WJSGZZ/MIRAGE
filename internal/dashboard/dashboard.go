@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,9 +60,10 @@ type Dashboard struct {
 	d                   *daemon.Daemon
 	servers             []SavedServer
 	activeID            string
-	file                string // path to servers.json
+	file                string // path to servers.json, or a profiles directory
 	proxyFile           string
 	proxyCfg            proxyConfig
+	bridgeMode          bool
 	probeAddr           string
 	startedAt           time.Time
 	logs                *memoryLog
@@ -74,12 +76,17 @@ type Dashboard struct {
 // New loads servers.json from file (creating it if absent) and returns a Dashboard.
 func New(file string) *Dashboard {
 	dash := &Dashboard{
-		d:         &daemon.Daemon{},
-		file:      file,
-		proxyFile: file + ".proxy.json",
-		probeAddr: "127.0.0.1:9099",
-		startedAt: time.Now(),
-		logs:      installMemoryLog(),
+		d:          &daemon.Daemon{},
+		file:       file,
+		bridgeMode: true,
+		probeAddr:  "127.0.0.1:9099",
+		startedAt:  time.Now(),
+		logs:       installMemoryLog(),
+	}
+	if dash.usesProfileDir() {
+		dash.proxyFile = filepath.Join(file, "proxy.json")
+	} else {
+		dash.proxyFile = file + ".proxy.json"
 	}
 	dash.load()
 	dash.loadProxyConfig()
@@ -492,6 +499,10 @@ func (dash *Dashboard) apiApplyWinHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
+	if dash.isBridgeMode() {
+		jsonErr(w, "bridge mode is read-only; MIRAGE will not change WinHTTP settings", http.StatusForbidden)
+		return
+	}
 	httpAddr := dash.d.HTTPListen()
 	if httpAddr == "" {
 		jsonErr(w, "proxy not running", http.StatusBadRequest)
@@ -510,6 +521,9 @@ func (dash *Dashboard) apiApplyWinHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (dash *Dashboard) ApplyWinHTTP() (Diagnostics, error) {
+	if dash.isBridgeMode() {
+		return Diagnostics{}, fmt.Errorf("bridge mode is read-only; MIRAGE will not change WinHTTP settings")
+	}
 	httpAddr := dash.d.HTTPListen()
 	if httpAddr == "" {
 		return Diagnostics{}, fmt.Errorf("proxy not running")
@@ -645,8 +659,10 @@ func (dash *Dashboard) apiDeleteServer(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, "not found", http.StatusNotFound)
 		return
 	}
+	removedID := dash.servers[idx].ID
 	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
 	dash.save()
+	dash.deleteProfileFile(removedID)
 	needReapply := false
 	if dash.activeID == id {
 		dash.d.Stop()
@@ -713,8 +729,10 @@ func (dash *Dashboard) DeleteServer(id string) error {
 	if idx < 0 {
 		return fmt.Errorf("not found")
 	}
+	removedID := dash.servers[idx].ID
 	dash.servers = append(dash.servers[:idx], dash.servers[idx+1:]...)
 	dash.save()
+	dash.deleteProfileFile(removedID)
 	needReapply := false
 	if dash.activeID == id {
 		dash.d.Stop()
@@ -729,6 +747,18 @@ func (dash *Dashboard) DeleteServer(id string) error {
 }
 
 func (dash *Dashboard) ReloadConfig() (int, error) {
+	if dash.usesProfileDir() {
+		list, err := dash.readProfileDir()
+		if err != nil {
+			return 0, fmt.Errorf("reload config: %w", err)
+		}
+		dash.mu.Lock()
+		dash.servers = list
+		dash.mu.Unlock()
+		log.Printf("dashboard: reloaded %d profiles from %s", len(list), dash.file)
+		return len(list), nil
+	}
+
 	data, err := os.ReadFile(dash.file)
 	if err != nil {
 		if errorsIs(err, fs.ErrNotExist) {
@@ -781,6 +811,23 @@ func (dash *Dashboard) LaunchWithProxy(command string, args []string) (map[strin
 }
 
 func (dash *Dashboard) load() {
+	if dash.usesProfileDir() {
+		list, err := dash.readProfileDir()
+		if err == nil && len(list) > 0 {
+			dash.servers = list
+			return
+		}
+		legacy := filepath.Join(filepath.Dir(dash.file), "servers.json")
+		if data, err := os.ReadFile(legacy); err == nil {
+			var legacyList []SavedServer
+			if json.Unmarshal(data, &legacyList) == nil && len(legacyList) > 0 {
+				dash.servers = legacyList
+				dash.save()
+			}
+		}
+		return
+	}
+
 	data, err := os.ReadFile(dash.file)
 	if err != nil {
 		return
@@ -789,11 +836,124 @@ func (dash *Dashboard) load() {
 }
 
 func (dash *Dashboard) save() {
+	if dash.usesProfileDir() {
+		_ = dash.saveProfileDir()
+		return
+	}
 	data, err := json.MarshalIndent(dash.servers, "", "  ")
 	if err != nil {
 		return
 	}
 	_ = os.WriteFile(dash.file, data, 0600)
+}
+
+func (dash *Dashboard) usesProfileDir() bool {
+	if strings.TrimSpace(dash.file) == "" {
+		return false
+	}
+	if st, err := os.Stat(dash.file); err == nil {
+		return st.IsDir()
+	}
+	return filepath.Ext(dash.file) == ""
+}
+
+func (dash *Dashboard) readProfileDir() ([]SavedServer, error) {
+	dir := dash.file
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var list []SavedServer
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if filepath.Ext(name) != ".json" || name == "proxy.json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var saved SavedServer
+		if err := json.Unmarshal(data, &saved); err != nil {
+			continue
+		}
+		if strings.TrimSpace(saved.ID) == "" || strings.TrimSpace(saved.Addr) == "" {
+			continue
+		}
+		list = append(list, saved)
+	}
+	return list, nil
+}
+
+func (dash *Dashboard) saveProfileDir() error {
+	if err := os.MkdirAll(dash.file, 0700); err != nil {
+		return err
+	}
+	for _, srv := range dash.servers {
+		if strings.TrimSpace(srv.ID) == "" {
+			continue
+		}
+		dash.deleteProfileFile(srv.ID)
+		name := srv.ID + "-" + safeProfileFilePart(srv.Name)
+		if name == srv.ID+"-" {
+			name = srv.ID + "-" + safeProfileFilePart(srv.Addr)
+		}
+		if name == srv.ID+"-" {
+			name = srv.ID
+		}
+		path := filepath.Join(dash.file, name+".json")
+		data, err := json.MarshalIndent(srv, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (dash *Dashboard) deleteProfileFile(id string) {
+	if !dash.usesProfileDir() || strings.TrimSpace(id) == "" {
+		return
+	}
+	matches, _ := filepath.Glob(filepath.Join(dash.file, id+"-*.json"))
+	if exact := filepath.Join(dash.file, id+".json"); exact != "" {
+		matches = append(matches, exact)
+	}
+	for _, path := range matches {
+		_ = os.Remove(path)
+	}
+}
+
+func safeProfileFilePart(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteRune('-')
+		}
+		if b.Len() >= 48 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "-_.")
 }
 
 func (dash *Dashboard) apiLogs(w http.ResponseWriter, r *http.Request) {
@@ -833,6 +993,7 @@ func (dash *Dashboard) currentState() stateResp {
 	dash.mu.Lock()
 	activeID := dash.activeID
 	proxyCfg := dash.proxyCfg
+	bridgeMode := dash.bridgeMode
 	lastAt := dash.lastProxyApplyAt
 	lastErr := dash.lastProxyApplyError
 	tunActive := dash.tunActive
@@ -863,6 +1024,10 @@ func (dash *Dashboard) currentState() stateResp {
 	}
 	if resp.Running {
 		resp.Status = "connected"
+	}
+	if bridgeMode {
+		resp.ProxyScope = "Bridge mode only. MIRAGE does not change Windows system proxy, WinHTTP, user environment variables, or TUN routes."
+		resp.CaptureGap = "Use Clash Verge Rev to enable System Proxy or TUN. MIRAGE only provides local HTTP/SOCKS and the compatibility subscription."
 	}
 	if !resp.Running {
 		resp.EnvHTTP = ""

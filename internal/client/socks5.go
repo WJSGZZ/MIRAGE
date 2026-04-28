@@ -9,19 +9,6 @@ import (
 	"net"
 )
 
-// ListenSocks5 starts a local proxy listener on addr and blocks until it fails.
-// Despite the name, the listener accepts both SOCKS5 and SOCKS4/4a clients so
-// Windows system-proxy users still work.
-func ListenSocks5(addr string, c *Client) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("socks5 listen %s: %w", addr, err)
-	}
-	log.Printf("miragec: SOCKS proxy listening on %s", addr)
-	Serve(ln, c, nil)
-	return nil
-}
-
 // Serve accepts connections from an existing listener and proxies them through c.
 // Returns when ln is closed.
 func Serve(ln net.Listener, c *Client, meter TrafficMeter) {

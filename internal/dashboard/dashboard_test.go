@@ -1,10 +1,12 @@
 package dashboard
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,6 +129,40 @@ func TestSpecEndpoints(t *testing.T) {
 	})
 }
 
+func TestBridgeModeRejectsProxyMutation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	dash := New(filepath.Join(dir, "profiles"))
+	dash.SetBridgeMode()
+	srv := httptest.NewServer(dash.Handler())
+	defer srv.Close()
+
+	body := bytes.NewBufferString(`{"mode":"system","applyWinHttp":true,"exportEnv":true}`)
+	resp, err := http.Post(srv.URL+"/proxy/config", "application/json", body)
+	if err != nil {
+		t.Fatalf("POST /proxy/config: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /proxy/config status=%d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	resp, err = http.Post(srv.URL+"/api/winhttp/apply", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /api/winhttp/apply: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /api/winhttp/apply status=%d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	got := dash.currentProxyConfig()
+	if got.Mode != proxyModeManual || got.ApplyWinHTTP || got.ExportEnv {
+		t.Fatalf("bridge mode changed proxy config: %+v", got)
+	}
+}
+
 func TestMihomoBypassRuleForAddr(t *testing.T) {
 	t.Parallel()
 
@@ -182,5 +218,42 @@ func TestMihomoProfileIncludesActiveServerBypass(t *testing.T) {
 	}
 	if strings.Index(text, want) > strings.Index(text, "MATCH,PROXY") {
 		t.Fatalf("server bypass rule must appear before MATCH: %s", text)
+	}
+}
+
+func TestProfileDirectoryStore(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "profiles")
+	dash := New(dir)
+	dash.servers = []SavedServer{{
+		ID:       "abc12345",
+		Name:     "my vps",
+		UserName: "user1",
+		Addr:     "107.173.160.207:8443",
+		SNI:      "www.microsoft.com",
+		Listen:   "127.0.0.1:1080",
+	}}
+	dash.save()
+
+	matches, err := filepath.Glob(filepath.Join(dir, "abc12345-*.json"))
+	if err != nil {
+		t.Fatalf("glob profile file: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one profile file, got %d (%v)", len(matches), matches)
+	}
+
+	reloaded := New(dir)
+	got := reloaded.Servers()
+	if len(got) != 1 || got[0].ID != "abc12345" || got[0].Addr != "107.173.160.207:8443" {
+		t.Fatalf("unexpected reloaded profiles: %+v", got)
+	}
+
+	if err := reloaded.DeleteServer("abc12345"); err != nil {
+		t.Fatalf("DeleteServer: %v", err)
+	}
+	if _, err := os.Stat(matches[0]); !os.IsNotExist(err) {
+		t.Fatalf("profile file still exists after delete: err=%v", err)
 	}
 }

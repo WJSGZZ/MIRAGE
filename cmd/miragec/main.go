@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -43,6 +44,10 @@ func main() {
 
 	flag.Parse()
 
+	if *tunMode || *setSystemProxy {
+		log.Fatalf("miragec: direct TUN/system-proxy control is disabled; run bridge mode and let Clash Verge manage System Proxy or TUN")
+	}
+
 	switch {
 	case strings.TrimSpace(*cfgPath) != "":
 		cfg, err := config.LoadClient(*cfgPath)
@@ -73,12 +78,46 @@ func main() {
 
 func runInteractive(serversFile, addr string) error {
 	fmt.Println("MIRAGE Clash bridge")
-	fmt.Println("Paste a mirage:// link and press Enter.")
-	fmt.Println("MIRAGE will start a local subscription for Clash Verge.")
+	fmt.Printf("Profiles are saved in: %s\n", serversFile)
+	fmt.Println("Choose a saved profile or import a new mirage:// link.")
 	fmt.Println()
-	fmt.Print("mirage:// > ")
 
 	reader := bufio.NewReader(os.Stdin)
+	dash := dashboard.New(serversFile)
+	profiles := dash.Servers()
+	for i, profile := range profiles {
+		fmt.Printf("  %d) %s  [%s]\n", i+1, profile.Name, profile.Addr)
+	}
+	if len(profiles) > 0 {
+		fmt.Println("  n) Import new mirage://")
+		fmt.Println("  q) Quit")
+		fmt.Print("Select profile [1]: ")
+		choice, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read selection: %w", err)
+		}
+		choice = strings.TrimSpace(strings.ToLower(choice))
+		if choice == "" {
+			choice = "1"
+		}
+		if choice == "q" || choice == "quit" {
+			return nil
+		}
+		if choice != "n" && choice != "new" {
+			idx, err := strconv.Atoi(choice)
+			if err != nil || idx < 1 || idx > len(profiles) {
+				return fmt.Errorf("invalid selection %q", choice)
+			}
+			fmt.Println()
+			fmt.Printf("Starting MIRAGE core with %s...\n", profiles[idx-1].Name)
+			return runCore(serversFile, addr, true, "", profiles[idx-1].ID, false)
+		}
+	}
+
+	if len(profiles) == 0 {
+		fmt.Println("No saved profiles yet.")
+	}
+	fmt.Print("mirage://... > ")
 	rawURI, err := reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("read URI: %w", err)
@@ -271,7 +310,7 @@ func printClashInstructions(addr string, state dashboard.State) {
 func defaultServersFile() string {
 	exe, err := os.Executable()
 	if err != nil {
-		return "servers.json"
+		return "profiles"
 	}
-	return filepath.Join(filepath.Dir(exe), "servers.json")
+	return filepath.Join(filepath.Dir(exe), "profiles")
 }

@@ -73,6 +73,7 @@ func (dash *Dashboard) loadProxyConfig() {
 
 func (dash *Dashboard) SetBridgeMode() {
 	dash.mu.Lock()
+	dash.bridgeMode = true
 	dash.proxyCfg = proxyConfig{
 		Mode:         proxyModeManual,
 		ApplyWinHTTP: false,
@@ -81,6 +82,12 @@ func (dash *Dashboard) SetBridgeMode() {
 	dash.saveProxyConfig()
 	dash.mu.Unlock()
 	dash.recordProxyApply(nil)
+}
+
+func (dash *Dashboard) isBridgeMode() bool {
+	dash.mu.Lock()
+	defer dash.mu.Unlock()
+	return dash.bridgeMode
 }
 
 func (dash *Dashboard) saveProxyConfig() {
@@ -143,6 +150,11 @@ func proxyModeApplied(mode string, snapshot sysproxy.Snapshot) bool {
 }
 
 func (dash *Dashboard) applyProxyPolicy() error {
+	if dash.isBridgeMode() {
+		dash.recordProxyApply(nil)
+		return nil
+	}
+
 	dash.mu.Lock()
 	cfg := dash.proxyCfg
 	dash.mu.Unlock()
@@ -193,6 +205,11 @@ func (dash *Dashboard) applyProxyPolicy() error {
 }
 
 func (dash *Dashboard) clearProxyAfterDisconnect() error {
+	if dash.isBridgeMode() {
+		dash.recordProxyApply(nil)
+		return nil
+	}
+
 	dash.mu.Lock()
 	cfg := dash.proxyCfg
 	dash.mu.Unlock()
@@ -312,6 +329,10 @@ func (dash *Dashboard) apiProxyConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		jsonOK(w, dash.currentProxyConfig())
 	case http.MethodPost:
+		if dash.isBridgeMode() {
+			jsonErr(w, "bridge mode is read-only; MIRAGE will not change system proxy settings", http.StatusForbidden)
+			return
+		}
 		var req proxyConfig
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -335,6 +356,11 @@ func (dash *Dashboard) apiProxyConfig(w http.ResponseWriter, r *http.Request) {
 func (dash *Dashboard) apiProxyReapply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if dash.isBridgeMode() {
+		dash.recordProxyApply(nil)
+		jsonOK(w, dash.currentProxyConfig())
 		return
 	}
 	if err := dash.applyProxyPolicy(); err != nil {

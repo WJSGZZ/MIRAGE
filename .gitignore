@@ -14,6 +14,7 @@ config.json
 client.json
 servers.json
 servers.json.proxy.json
+profiles/
 bootstrap.txt
 
 # Go dependency locks are committed for reproducible VPS builds.

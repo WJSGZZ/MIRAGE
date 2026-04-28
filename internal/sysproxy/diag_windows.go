@@ -90,21 +90,6 @@ func normalizeMultiline(s string) string {
 	return strings.Join(out, " | ")
 }
 
-func ParseNetshProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "\ufeff")
-	return normalizeMultiline(raw)
-}
-
-func CombinedOutput(command string, args ...string) string {
-	cmd := exec.Command(command, args...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	_ = cmd.Run()
-	return strings.TrimSpace(decodeWindowsText(buf.Bytes()))
-}
-
 func decodeWindowsText(b []byte) string {
 	if utf8.Valid(b) {
 		return string(b)

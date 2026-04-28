@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/hmac"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -291,12 +292,5 @@ func (rt *runtimeState) rememberReplay(key [32]byte) bool {
 }
 
 func hmacTokenEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
+	return hmac.Equal(a, b)
 }
